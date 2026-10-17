@@ -1,0 +1,118 @@
+name: Build and test
+description: >
+  Build every platform target with a given Zig version, run the unit tests and the artifact checks, load the
+  linux_amd64 build into the stock (checksum-verified) DuckDB CLI, and optionally upload each platform's shipped zip.
+  Shared by ci.yml (Zig 0.17) and zig-0.15.yml (Zig 0.15.2) so the two can never drift apart.
+  Run actions/checkout (fetch-depth: 0, for the version in the footer) before using it.
+
+inputs:
+  zig-version:
+    description: Zig version to install (for example 0.17.0 or 0.15.2)
+    required: true
+  upload-artifacts:
+    description: "'true' to upload each platform's shipped zip as a build artifact named duckdb_oracle-<platform>"
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ inputs.zig-version }}
+
+    - name: Zig version
+      shell: bash
+      run: zig version
+
+    - name: Zig unit tests
+      shell: bash
+      run: zig build test --summary all
+
+    - name: Build all platforms (Windows and macOS cross-compiled)
+      shell: bash
+      run: >
+        zig build -Dplatform=linux_amd64 -Dplatform=linux_amd64_gcc4 -Dplatform=windows_amd64
+        -Dplatform=windows_arm64 -Dplatform=osx_arm64 --summary all
+
+    # Also runs tools/test_ci_config.py, which parses the workflow files and needs PyYAML (hence the virtualenv:
+    # the system Python of a hosted runner is externally managed).
+    - name: Verifier and CI-configuration unit tests (the rules that gate every artifact and every workflow)
+      shell: bash
+      env:
+        DUCKDB_ORACLE_WINDOWS_DLL: ${{ github.workspace }}/zig-out/windows_amd64/duckdb_oracle.duckdb_extension
+      run: |
+        python3 -m venv .venv
+        .venv/bin/pip install -q pyyaml
+        .venv/bin/python -m unittest discover -s tools -v
+
+    - name: Verify artifacts - shipped name, footer, and for Windows the PE image
+      shell: bash
+      run: |
+        for p in linux_amd64 linux_amd64_gcc4 windows_amd64 windows_arm64 osx_arm64; do
+          python3 tools/verify_artifact.py check "zig-out/dist/duckdb_oracle-$p.zip" --platform "$p" --capi-version v1.2.0
+        done
+
+    - name: Every -Dduckdb-version in range compiles (stable API only)
+      shell: bash
+      run: |
+        for v in v1.2.0 v1.3.0 v1.4.0 v1.5.0 v1.5.6; do
+          zig build -Dplatform=linux_amd64 -Dduckdb-version="$v" --prefix "/tmp/zo-$v"
+          python3 tools/verify_artifact.py check "/tmp/zo-$v/linux_amd64/duckdb_oracle.duckdb_extension" --platform linux_amd64 --capi-version "$v"
+        done
+
+    - name: Download the pinned official DuckDB CLI (checksum verified)
+      shell: bash
+      run: tools/fetch-duckdb-cli.sh linux-amd64 "$RUNNER_TEMP/duckdb-cli"
+
+    # Loads the shipped zip's file into the stock CLI: not preinstalled, LOAD exits 0, loaded = true,
+    # and the negative control (a platform-suffixed copy must fail with duckdb_oracle-<platform>_init_c_api).
+    - name: Stock-DuckDB load test (linux_amd64)
+      shell: bash
+      run: >
+        python3 tools/verify_artifact.py check "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip"
+        --platform linux_amd64 --capi-version v1.2.0 --duckdb "$RUNNER_TEMP/duckdb-cli/duckdb" --client none
+
+    - name: SQLLogicTests (stock duckdb Python wheel)
+      shell: bash
+      env:
+        # duckdb-sqllogictest-python commit pinned by duckdb/extension-ci-tools (v1.5.6 branch)
+        SQLLOGICTEST_REF: 2ac8dbc012ddbd96a57dca37784fd8ee3c0eb021
+      run: |
+        duckdb_version=$(jq -er '.version | ltrimstr("v")' tools/duckdb-cli-pins.json)
+        python3 -m venv .venv
+        .venv/bin/pip install -q "duckdb==$duckdb_version" packaging "git+https://github.com/duckdb/duckdb-sqllogictest-python@${SQLLOGICTEST_REF}"
+        zig build sqllogictest -Dpython="$PWD/.venv/bin/python" --summary all
+
+    # One artifact per platform, each containing the shipped zip, so other workflows (e2e-oracle19c.yml)
+    # can download exactly the platform they need.
+    - uses: actions/upload-artifact@v4
+      if: inputs.upload-artifacts == 'true'
+      with:
+        name: duckdb_oracle-linux_amd64
+        path: zig-out/dist/duckdb_oracle-linux_amd64.zip
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      if: inputs.upload-artifacts == 'true'
+      with:
+        name: duckdb_oracle-linux_amd64_gcc4
+        path: zig-out/dist/duckdb_oracle-linux_amd64_gcc4.zip
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      if: inputs.upload-artifacts == 'true'
+      with:
+        name: duckdb_oracle-windows_amd64
+        path: zig-out/dist/duckdb_oracle-windows_amd64.zip
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      if: inputs.upload-artifacts == 'true'
+      with:
+        name: duckdb_oracle-windows_arm64
+        path: zig-out/dist/duckdb_oracle-windows_arm64.zip
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      if: inputs.upload-artifacts == 'true'
+      with:
+        name: duckdb_oracle-osx_arm64
+        path: zig-out/dist/duckdb_oracle-osx_arm64.zip
+        if-no-files-found: error

@@ -1,0 +1,23 @@
+name: Zig 0.15.2 compatibility
+
+# Manual. The same build and tests as ci.yml, on the oldest supported Zig, to keep the compat layer
+# (build_compat.zig, src/compat.zig) honest. Nothing is uploaded: ci.yml's artifacts stay the Zig 0.17 builds.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build all platforms and test (Zig 0.15.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/build-test
+        with:
+          zig-version: 0.15.2
+          upload-artifacts: 'false'

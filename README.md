@@ -122,7 +122,7 @@ More messages: [docs/REFERENCE.md](docs/REFERENCE.md#errors).
 * **Unsigned**, so it can't be installed with `INSTALL ... FROM community`; you must start DuckDB with `-unsigned`.
 * **Needs the 64-bit Oracle Instant Client** to match your DuckDB. Oracle has no Windows ARM64 client; see [compatibility](docs/COMPATIBILITY.md).
 * **One Oracle session per query, read by one thread.** Ctrl+C can't cancel a running Oracle call; connect and call timeouts (30 s / 600 s by default) end hangs.
-* **Early software.** Oracle 19c is the main target, but automated tests against a live Oracle server only run in CI, on Oracle Free 23ai. Please report problems.
+* **Early software.** Oracle 19c is the main target, but the tests against a live Oracle server run only on demand, on the maintainer's own 19c database. Please report problems.
 
 The full list is in [docs/REFERENCE.md](docs/REFERENCE.md#known-limitations); plans are in [docs/ROADMAP.md](docs/ROADMAP.md).
 

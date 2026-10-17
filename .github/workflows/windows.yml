@@ -1,0 +1,43 @@
+name: Windows load test
+
+# Manual. Builds the windows_amd64 extension on a real Windows runner with Zig 0.15.2 and 0.17, then loads the
+# shipped zip's file into the official, checksum-verified DuckDB CLI (the version pinned in
+# tools/duckdb-cli-pins.json): LOAD using the exact shipped file name, duckdb_extensions() must show it loaded,
+# and oracle_client_info() must run. test-windows.ps1 does all of that; -SkipOracle because this runner has no Oracle.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows, Zig ${{ matrix.zig }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        zig: ['0.15.2', '0.17.0']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> extension version in the footer
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+
+      - name: Build windows_amd64 on Windows
+        run: zig build -Dplatform=windows_amd64 --summary all
+
+      # Downloads the pinned CLI, verifies its SHA-256, unzips the shipped zip (it must contain exactly
+      # duckdb_oracle.duckdb_extension), LOADs it, checks duckdb_extensions(), runs oracle_client_info().
+      - name: Stock-CLI load test (PowerShell 7)
+        shell: pwsh
+        run: .\test-windows.ps1 -SkipOracle -Extension zig-out\dist\duckdb_oracle-windows_amd64.zip -TimeoutSeconds 90
+
+      # The self-hosted e2e runner uses Windows PowerShell 5.1, so keep that working too.
+      - name: Stock-CLI load test (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\test-windows.ps1 -SkipOracle -Extension zig-out\dist\duckdb_oracle-windows_amd64.zip -TimeoutSeconds 90

@@ -32,9 +32,9 @@ Extension API. **v1.5.6 is the tested baseline**: its headers are vendored and t
 
 | Official DuckDB CLI | linux_amd64 (default build) | windows_amd64 (default build) |
 |---|---|---|
-| v1.5.0 – v1.5.6 (newest at time of writing) | ✅ loaded (tested v1.5.0, v1.5.6) | ✅ v1.5.6 under Wine; CI matrix |
-| v1.3.x, v1.4.x | ✅ loaded (tested v1.3.2, v1.4.5) | CI matrix (v1.3.2, v1.4.5) |
-| v1.2.x | ⚠️ these Linux CLIs report platform `linux_amd64_gcc4`. Use the `linux_amd64_gcc4` zip (or `-Dplatform=linux_amd64_gcc4`): the library bytes are identical and only the footer label differs. Alternatively, load the unchanged file after `SET allow_extensions_metadata_mismatch=true;`. Both tested on v1.2.0 and v1.2.2 | ✅ v1.2.0 under Wine; CI matrix |
+| v1.5.0 – v1.5.6 (newest at time of writing) | ✅ loaded (tested v1.5.0, v1.5.6) | ✅ v1.5.6 under Wine; `windows.yml` (manual) loads it on a Windows runner |
+| v1.3.x, v1.4.x | ✅ loaded (tested v1.3.2, v1.4.5) | v1.3.2 and v1.4.5 were covered by the former CI matrix; now a manual check (see [BUILDING.md](BUILDING.md#continuous-integration)) |
+| v1.2.x | ⚠️ these Linux CLIs report platform `linux_amd64_gcc4`. Use the `linux_amd64_gcc4` zip (or `-Dplatform=linux_amd64_gcc4`): the library bytes are identical and only the footer label differs. Alternatively, load the unchanged file after `SET allow_extensions_metadata_mismatch=true;`. Both tested on v1.2.0 and v1.2.2 | ✅ v1.2.0 under Wine; also covered by the former CI matrix, now a manual check |
 | ≤ v1.1.x | ❌ no C Extension API. Rejected cleanly ("built for DuckDB C API version 'v1.2.0'") | ❌ |
 | 2.x (does not exist yet) | ❌ C API major version must be 1 | ❌ |
 
@@ -105,11 +105,13 @@ CLI by default; use `-DuckDBArch arm64` for the native one.
 
 ## Oracle server and client versions
 
-* **Oracle Database 19c** is the primary target; **23ai/26ai** is secondary. No 19c server is used in the automated tests. The
-  `live-oracle` CI job runs real queries against Oracle Free 23ai (see [BUILDING.md](BUILDING.md#continuous-integration)).
+* **Oracle Database 19c** is the primary target; **23ai/26ai** is secondary. The end-to-end tests (`test/e2e`) run against a real
+  19c database through the manual, owner-only `e2e-oracle19c.yml` workflow on a self-hosted runner (see
+  [SELF_HOSTED_RUNNER.md](SELF_HOSTED_RUNNER.md)). No Oracle database is used by the automatic CI, and `test-windows.ps1` can run the same
+  tests against an optional 23ai/26ai database.
 * **Instant Client** 19c or newer. Tested on Linux with **Basic 19.26.0.0.0** and **Basic 23.26.2.0.0**. On Windows the maintainer
-  used x64 Basic 19.26, and the 23ai-generation Windows client has been loaded and exercised up to the connect step (the automated
-  Windows runs use Wine). Oracle's interoperability rules allow a newer client to connect to an older server (for example a 23ai
+  used x64 Basic 19.26, and the 23ai-generation Windows client has been loaded and exercised up to the connect step (under Wine, with
+  `tools/windows-locator-test.sh`, which is run by hand). Oracle's interoperability rules allow a newer client to connect to an older server (for example a 23ai
   client to 19c); this project's tests have not exercised that combination.
 * Instant Client 19 on Windows needs the Visual Studio 2017 (or later) x64 C++ runtime.
 * The 23ai/26ai column types (`BOOLEAN`, `VECTOR`, native `JSON`) only work if the **client** understands them: see

@@ -1,0 +1,9 @@
+{
+  "version": "v1.5.6",
+  "note": "The one place the DuckDB CLI version and the checksums of its official release assets are pinned. Used by every workflow and by test-windows.ps1. SHA-256 values were computed from the downloads and match the digests GitHub publishes on the release page.",
+  "sha256": {
+    "duckdb_cli-linux-amd64.zip": "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f",
+    "duckdb_cli-windows-amd64.zip": "798eae475d07c645ff3b914f7b0e676d06502b5412dd7552638fafed81f9e916",
+    "duckdb_cli-windows-arm64.zip": "266052dbf513da86d0d90209db09ec56e79af75b7fbe2d952810526dfc5d2726"
+  }
+}

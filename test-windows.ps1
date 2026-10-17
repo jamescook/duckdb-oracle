@@ -1,55 +1,64 @@
 <#
 .SYNOPSIS
-    duckdb-oracle smoke test for Windows: stock DuckDB CLI (default v1.5.6) + external duckdb-oracle
-    extension + (optionally) the local Oracle 19c Docker container.
+    duckdb-oracle test for Windows: stock DuckDB CLI + the shipped duckdb-oracle extension + (optionally) the
+    end-to-end SQL tests in test/e2e against a real Oracle database. The same script runs locally and in CI
+    (.github/workflows/windows.yml and e2e-oracle19c.yml), so the runs are identical.
 
 .DESCRIPTION
-    1. Checks which oci.dll the extension will load and whether it is 64-bit.
-    2. Verifies that the stock DuckDB CLI does NOT already contain duckdb_oracle.
-    Also detects the host architecture (Windows on ARM) and warns on any
-    architecture mismatch between duckdb.exe, the extension and oci.dll.
-    3. Unpacks the shipped package duckdb_oracle-windows_<arch>.zip (default:
-       next to this script; -Extension takes a zip or a file that is already
-       named duckdb_oracle.duckdb_extension - nothing is renamed), then
-       LOADs duckdb_oracle.duckdb_extension with -unsigned and prints
-       duckdb_extensions() and oracle_client_info().
-    4. Unless -SkipOracle: runs queries against the Oracle container
-       (SELECT * FROM dual, a type-coverage query, multi-batch + LIMIT) and an
-       unreachable-DSN error check.
-    5. Optional: if $env:ORACLE_DSN_23AI is set, the same checks plus
-       BOOLEAN / JSON / VECTOR mapping against a 23ai/26ai database (for
-       example gvenzl/oracle-free on localhost:1522/FREEPDB1).
-    Every DuckDB run prints its exit code in decimal and hex, so an access
-    violation shows up as 0xC0000005. Each run has a timeout so a hang is
-    reported instead of blocking forever.
+    1. Downloads the official DuckDB CLI for the version pinned in tools/duckdb-cli-pins.json and verifies its
+       SHA-256 (or uses the binary given with -DuckDB). The CLI found on PATH is never used.
+    2. Unpacks the shipped package duckdb_oracle-windows_<arch>.zip (default: next to this script; -Extension takes a
+       zip or a file already named duckdb_oracle.duckdb_extension - nothing is renamed) and verifies that the stock
+       CLI does NOT already contain duckdb_oracle.
+    3. Checks which oci.dll the extension will load (same search policy as the extension itself) and whether it is
+       64-bit, and detects Windows on ARM and any architecture mismatch between duckdb.exe, the extension and oci.dll.
+    4. LOADs duckdb_oracle.duckdb_extension with -unsigned, shows duckdb_extensions() and oracle_client_info().
+    5. Unless -SkipOracle: waits for the database (-WaitForDatabase), then runs every test/e2e/*.sql against it:
+       SELECT FROM dual, one test per mapped type, NULLs, a multi-batch fetch, LIMIT early termination, and Oracle
+       errors that must surface ORA- codes while the process keeps running.
+    6. Optional: if $env:ORACLE_DSN_23AI is set, the same tests plus test/e2e/23ai (BOOLEAN / JSON / VECTOR) against
+       a 23ai/26ai database (for example gvenzl/oracle-free on localhost:1522/FREEPDB1).
+    Every DuckDB run prints its exit code in decimal and hex, so an access violation shows up as 0xC0000005. Each run
+    has a timeout so a hang is reported instead of blocking forever.
 
-    The password is read ONLY from $env:ORACLE_PASSWORD by the extension
-    itself. It is never placed on a command line, in a SQL file, or printed.
-    Set it without echoing, e.g.:
+    -Strict is the CI mode: a skipped Oracle step, a missing or wrong-architecture oci.dll and architecture warnings
+    are failures instead of warnings.
+
+    The password is read ONLY from $env:ORACLE_PASSWORD, by the extension itself. It is never placed on a command
+    line or in a SQL file, and it is removed from any output before printing. Set it without echoing, e.g.:
         $s = Read-Host 'Oracle password' -AsSecureString
         $env:ORACLE_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+    The connect string and user come from -Dsn / -User, else $env:ORACLE_DSN / $env:ORACLE_USER.
 
 .EXAMPLE
-    .\test-windows.ps1
+    .\test-windows.ps1 -SkipOracle                 # load test only (what windows.yml runs)
+.EXAMPLE
+    .\test-windows.ps1 -Dsn dbhost:1521/ORCLPDB1 -User SCOTT      # plus the end-to-end tests
+.EXAMPLE
+    .\test-windows.ps1 -Strict -WaitForDatabase 300 -Extension .\duckdb_oracle-windows_amd64.zip   # what e2e-oracle19c.yml runs
 .EXAMPLE
     .\test-windows.ps1 -DuckDB C:\tools\duckdb.exe -Extension .\duckdb_oracle-windows_amd64.zip
-.EXAMPLE
-    .\test-windows.ps1 -SkipOracle      # load test only (what CI runs)
-.EXAMPLE
-    .\test-windows.ps1 -SkipOracle -DuckDBVersion v1.3.2   # another official release
 #>
 [CmdletBinding()]
 param(
     [string]$Extension = '',
     [string]$DuckDB = '',
-    [string]$Dsn = 'localhost:1521/ORCLPDB1',
-    [string]$User = 'SAMPLE_DEV',
+    [string]$Dsn = $(if ($env:ORACLE_DSN) { $env:ORACLE_DSN } else { 'localhost:1521/ORCLPDB1' }),
+    [string]$User = $(if ($env:ORACLE_USER) { $env:ORACLE_USER } else { 'SAMPLE_DEV' }),
     [switch]$SkipOracle,
+    # CI mode: skipped Oracle steps, a missing / wrong-architecture oci.dll and architecture warnings fail the run.
+    [switch]$Strict,
+    # Seconds to wait for the database to answer SELECT 1 FROM dual before the tests start (0 = do not wait).
+    [int]$WaitForDatabase = 0,
     [int]$TimeoutSeconds = 120,
-    # Official DuckDB release to download/expect (any 1.x >= the footer's C API
-    # version works; v1.5.6 is the tested baseline).
-    [string]$DuckDBVersion = 'v1.5.6',
+    # Directory with the end-to-end SQL tests (shared with the CI workflow).
+    [string]$E2EDir = '',
+    # DuckDB CLI release to download. Default: the version pinned in -PinFile. Another version has no pinned
+    # checksum and needs -SkipChecksum.
+    [string]$DuckDBVersion = '',
+    [string]$PinFile = '',
+    [switch]$SkipChecksum,
     # CLI to download when -DuckDB is not given. x64 is also the right choice on
     # Windows ARM64 hosts (no ARM64 Oracle Instant Client exists).
     [ValidateSet('x64', 'arm64')]
@@ -98,9 +107,25 @@ function Get-PeMachine([string]$Path) {
     }
 }
 
+function Test-HasSecret([string]$Text) {
+    foreach ($secret in @($env:ORACLE_PASSWORD, $env:ORACLE_PASSWORD_23AI)) {
+        if ($secret -and $secret.Length -ge 4 -and $Text -and $Text.Contains($secret)) { return $true }
+    }
+    return $false
+}
+
+function Hide-Secrets([string]$Text) {
+    # The password never goes on a command line or into SQL; this also keeps it out of anything printed.
+    foreach ($secret in @($env:ORACLE_PASSWORD, $env:ORACLE_PASSWORD_23AI)) {
+        if ($secret -and $secret.Length -ge 4 -and $Text) { $Text = $Text.Replace($secret, '***') }
+    }
+    return $Text
+}
+
 function Invoke-DuckDB {
     # Runs the CLI on a SQL file (no SQL on the command line), with a timeout.
-    param([string]$Name, [string]$Sql, [switch]$Unsigned, [string[]]$ExtraArgs = @())
+    param([string]$Name, [string]$Sql, [switch]$Unsigned, [string[]]$ExtraArgs = @(), [int]$Timeout = 0, [switch]$Quiet)
+    if ($Timeout -le 0) { $Timeout = $TimeoutSeconds }
     $sqlFile = Join-Path $WorkDir ($Name + '.sql')
     $outFile = Join-Path $WorkDir ($Name + '.out.txt')
     $errFile = Join-Path $WorkDir ($Name + '.err.txt')
@@ -112,7 +137,7 @@ function Invoke-DuckDB {
     $p = Start-Process -FilePath $script:DuckDBExe -ArgumentList ($argList -join ' ') -NoNewWindow -PassThru `
         -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $null = $p.Handle   # make ExitCode available after exit (PowerShell quirk)
-    $timedOut = -not $p.WaitForExit($TimeoutSeconds * 1000)
+    $timedOut = -not $p.WaitForExit($Timeout * 1000)
     if ($timedOut) {
         try { $p.Kill() } catch { }
         $code = -1
@@ -120,16 +145,21 @@ function Invoke-DuckDB {
         $p.WaitForExit()
         $code = [int]$p.ExitCode
     }
-    $stdout = if (Test-Path $outFile) { [IO.File]::ReadAllText($outFile) } else { '' }
-    $stderr = if (Test-Path $errFile) { [IO.File]::ReadAllText($errFile) } else { '' }
-    if ($stdout) { Write-Host $stdout.TrimEnd() }
-    if ($stderr) { Write-Host $stderr.TrimEnd() -ForegroundColor Yellow }
-    if ($timedOut) {
-        Write-Host ("TIMEOUT after {0}s (process killed) - treat as a hang" -f $TimeoutSeconds) -ForegroundColor Red
-    } else {
-        Write-Host ('exit code: ' + (Format-ExitCode $code))
+    $rawOut = $(if (Test-Path $outFile) { [IO.File]::ReadAllText($outFile) } else { '' })
+    $rawErr = $(if (Test-Path $errFile) { [IO.File]::ReadAllText($errFile) } else { '' })
+    $leaked = (Test-HasSecret $rawOut) -or (Test-HasSecret $rawErr)   # checked BEFORE redaction
+    $stdout = Hide-Secrets $rawOut
+    $stderr = Hide-Secrets $rawErr
+    if (-not $Quiet) {
+        if ($stdout) { Write-Host $stdout.TrimEnd() }
+        if ($stderr) { Write-Host $stderr.TrimEnd() -ForegroundColor Yellow }
+        if ($timedOut) {
+            Write-Host ("TIMEOUT after {0}s (process killed) - treat as a hang" -f $Timeout) -ForegroundColor Red
+        } else {
+            Write-Host ('exit code: ' + (Format-ExitCode $code))
+        }
     }
-    return [pscustomobject]@{ Code = $code; TimedOut = $timedOut; Out = $stdout; Err = $stderr }
+    return [pscustomobject]@{ Code = $code; TimedOut = $timedOut; Out = $stdout; Err = $stderr; Leaked = $leaked }
 }
 
 function SqlLit([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
@@ -169,34 +199,65 @@ if ($HostArch -eq 'ARM64') {
 }
 
 # --- DuckDB CLI --------------------------------------------------------------
-Write-Section "Stock DuckDB CLI $DuckDBVersion"
+# The version and the SHA-256 of each official release asset are pinned in tools/duckdb-cli-pins.json (the one
+# place shared with the CI workflows). The CLI is downloaded and verified here; a duckdb.exe on PATH is never used.
+function Get-DuckDBPin {
+    $candidates = @()
+    if ($PinFile) { $candidates += $PinFile }
+    $candidates += (Join-Path $PSScriptRoot 'tools\duckdb-cli-pins.json')
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return (Get-Content -Raw -LiteralPath $c | ConvertFrom-Json) }
+    }
+    return $null
+}
+$Pin = Get-DuckDBPin
+# No second copy of the version lives in this script: it comes from the pin file (or -DuckDBVersion).
+if (-not $DuckDBVersion -and $Pin) { $DuckDBVersion = $Pin.version }
+
+Write-Section ('Stock DuckDB CLI ' + $(if ($DuckDBVersion) { $DuckDBVersion } else { '(version not pinned)' }))
 $script:DuckDBExe = $null
 if ($DuckDB) {
     $script:DuckDBExe = (Resolve-Path $DuckDB).Path
+    Write-Host "Using the DuckDB CLI given with -DuckDB (no download, no checksum check): $script:DuckDBExe"
 } else {
-    $onPath = Get-Command duckdb.exe -ErrorAction SilentlyContinue
-    if ($onPath) {
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $v = (& $onPath.Source -version) 2>$null | Out-String
-        $ErrorActionPreference = $eap
-        $onPathArch = Get-PeMachine $onPath.Source
-        if (($v -match [regex]::Escape($DuckDBVersion)) -and ($onPathArch -eq (ConvertTo-Arch $DuckDBArch))) { $script:DuckDBExe = $onPath.Source }
-        else { Write-Host ("duckdb on PATH is '{0}' ({1}), not {2} {3}; downloading the official CLI" -f $v.Trim(), $onPathArch, $DuckDBVersion, $DuckDBArch) }
+    if (-not $DuckDBVersion) { throw 'tools\duckdb-cli-pins.json was not found next to this script, so there is no pinned DuckDB version. Pass -PinFile, or -DuckDB <your duckdb.exe>, or -DuckDBVersion together with -SkipChecksum.' }
+    $zipName = if ($DuckDBArch -eq 'arm64') { 'duckdb_cli-windows-arm64.zip' } else { 'duckdb_cli-windows-amd64.zip' }
+    $wantHash = $null
+    if ($Pin -and $Pin.version -eq $DuckDBVersion) {
+        $prop = $Pin.sha256.PSObject.Properties[$zipName]
+        if ($prop) { $wantHash = ([string]$prop.Value).ToLowerInvariant() }
     }
-    if (-not $script:DuckDBExe) {
-        $zipName = if ($DuckDBArch -eq 'arm64') { 'duckdb_cli-windows-arm64.zip' } else { 'duckdb_cli-windows-amd64.zip' }
-        $url = "https://github.com/duckdb/duckdb/releases/download/$DuckDBVersion/$zipName"
-        $dir = Join-Path $WorkDir "duckdb-$DuckDBVersion-$DuckDBArch"
-        $exe = Join-Path $dir 'duckdb.exe'
-        if (-not (Test-Path $exe)) {
-            $zip = Join-Path $WorkDir $zipName
-            Write-Host "Downloading $url"
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
-            Expand-Archive -Path $zip -DestinationPath $dir -Force
+    if (-not $wantHash -and -not $SkipChecksum) {
+        throw ("No pinned SHA-256 for {0} {1} (pin file: tools\duckdb-cli-pins.json{2}). Use the pinned version, or pass -SkipChecksum to download it unverified." -f $zipName, $DuckDBVersion, $(if ($Pin) { '' } else { ' - NOT FOUND next to this script; pass -PinFile' }))
+    }
+    $url = "https://github.com/duckdb/duckdb/releases/download/$DuckDBVersion/$zipName"
+    $dir = Join-Path $WorkDir "duckdb-$DuckDBVersion-$DuckDBArch"
+    $zip = Join-Path $WorkDir ("$DuckDBVersion-$zipName")
+    $haveZip = $false
+    if (Test-Path -LiteralPath $zip) {
+        # a cached download is reused only if it still matches the pinned checksum
+        if ($wantHash -and ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -eq $wantHash)) { $haveZip = $true }
+        else { Remove-Item -Force -LiteralPath $zip; if (Test-Path $dir) { Remove-Item -Recurse -Force $dir } }
+    }
+    if (-not $haveZip) {
+        Write-Host "Downloading $url"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+        $gotHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+        if ($wantHash) {
+            if ($gotHash -ne $wantHash) {
+                Remove-Item -Force -LiteralPath $zip
+                Add-Result 'duckdb checksum' 'FAIL' ("{0}: downloaded {1}, pinned {2}" -f $zipName, $gotHash, $wantHash)
+                throw ("CHECKSUM MISMATCH for {0} {1}`n  pinned:     {2}`n  downloaded: {3}" -f $zipName, $DuckDBVersion, $wantHash, $gotHash)
+            }
+        } else {
+            Write-Warning "-SkipChecksum: $zipName $DuckDBVersion was NOT verified (sha256 $gotHash)"
         }
-        $script:DuckDBExe = $exe
     }
+    if ($wantHash) { Write-Host ("SHA-256 verified against tools\duckdb-cli-pins.json: {0}" -f $wantHash); Add-Result 'duckdb checksum' 'PASS' ($zipName + ' ' + $DuckDBVersion) }
+    $exe = Join-Path $dir 'duckdb.exe'
+    if (-not (Test-Path $exe)) { Expand-Archive -Path $zip -DestinationPath $dir -Force }
+    $script:DuckDBExe = $exe
 }
 $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $verText = ((& $script:DuckDBExe -version) 2>&1 | Out-String).Trim()
@@ -205,7 +266,9 @@ $CliArch = Get-PeMachine $script:DuckDBExe
 Write-Host ('DuckDB CLI     : {0}' -f $script:DuckDBExe)
 Write-Host ('Version        : {0}' -f $verText)
 Write-Host ('CLI arch       : {0}{1}' -f $CliArch, $(if ($HostArch -eq 'ARM64' -and $CliArch -eq 'x64') { ' (runs under x64 emulation on this ARM64 host)' } else { '' }))
-if ($verText -notmatch [regex]::Escape($DuckDBVersion)) {
+if (-not $DuckDBVersion) {
+    Add-Result 'duckdb version' 'PASS' ($verText + ' (no pinned version to compare with)')
+} elseif ($verText -notmatch [regex]::Escape($DuckDBVersion)) {
     Add-Result 'duckdb version' 'FAIL' $verText
     Write-Warning "Expected DuckDB $DuckDBVersion"
 } else {
@@ -254,24 +317,29 @@ Write-Host ('SHA256         : {0}' -f (Get-FileHash -Algorithm SHA256 $Extension
 
 # --- oci.dll resolution ------------------------------------------------------
 Write-Section 'Oracle client (oci.dll) resolution'
-# ODPI-C load order: 1) $env:DUCKDB_ORACLE_CLIENT_LIB_DIR only, if set;
-# 2) the extension's own directory; 3) Windows LoadLibrary search
-# (directory of duckdb.exe, System32, Windows, current dir, PATH in order).
+# Mirrors the extension's own search (src/client_locator.zig):
+#   1) $env:DUCKDB_ORACLE_CLIENT_LIB_DIR, and nothing else, if it is set;
+#   2) otherwise the extension's directory, duckdb.exe's directory, then each ABSOLUTE entry of PATH.
+# The current directory, System32 and relative PATH entries are never searched. The extension skips an oci.dll of the
+# wrong architecture and goes on; this script is stricter on purpose: the FIRST one must match duckdb.exe, so that
+# the setup is unambiguous.
 $candidates = New-Object System.Collections.ArrayList
 $libDirOverride = $env:DUCKDB_ORACLE_CLIENT_LIB_DIR
 if ($libDirOverride) {
-    Write-Host "DUCKDB_ORACLE_CLIENT_LIB_DIR is set: ODPI-C will ONLY look in $libDirOverride"
+    Write-Host "DUCKDB_ORACLE_CLIENT_LIB_DIR is set: the extension will ONLY look in $libDirOverride"
     $null = $candidates.Add([pscustomobject]@{ Source = 'DUCKDB_ORACLE_CLIENT_LIB_DIR'; Dir = $libDirOverride })
 } else {
     $null = $candidates.Add([pscustomobject]@{ Source = 'extension dir'; Dir = (Split-Path $Extension) })
     $null = $candidates.Add([pscustomobject]@{ Source = 'duckdb.exe dir'; Dir = (Split-Path $script:DuckDBExe) })
-    $null = $candidates.Add([pscustomobject]@{ Source = 'System32'; Dir = [Environment]::SystemDirectory })
-    $null = $candidates.Add([pscustomobject]@{ Source = 'Windows'; Dir = $env:windir })
-    $null = $candidates.Add([pscustomobject]@{ Source = 'current dir'; Dir = (Get-Location).Path })
     $i = 0
     foreach ($d in ($env:PATH -split [regex]::Escape([IO.Path]::PathSeparator))) {
         $i++
-        if ($d.Trim()) { $null = $candidates.Add([pscustomobject]@{ Source = "PATH[$i]"; Dir = $d.Trim() }) }
+        $d = $d.Trim().Trim('"')
+        if (-not $d) { continue }
+        # relative entries are never searched: on Windows only X:\ and \\server paths are absolute
+        $isAbsolute = $(if ($env:OS -eq 'Windows_NT') { $d -match '^([A-Za-z]:[\\/]|\\\\)' } else { [IO.Path]::IsPathRooted($d) })
+        if (-not $isAbsolute) { continue }
+        $null = $candidates.Add([pscustomobject]@{ Source = "PATH[$i]"; Dir = $d })
     }
 }
 $found = @()
@@ -285,19 +353,21 @@ foreach ($c in $candidates) {
     }
 }
 $OciArch = $null
+$ociBad = $(if ($Strict) { 'FAIL' } else { 'WARN' })
 if ($found.Count -eq 0) {
     Write-Warning 'No oci.dll found. LOAD will still work, but oracle_query() will fail with DPI-1047.'
-    Add-Result 'oci.dll' 'WARN' 'not found'
+    Add-Result 'oci.dll' $ociBad 'not found: put the x64 Oracle Instant Client directory on PATH (or set DUCKDB_ORACLE_CLIENT_LIB_DIR)'
 } else {
-    Write-Host 'oci.dll candidates in load order:'
+    Write-Host 'oci.dll candidates in search order:'
     $found | Format-Table -AutoSize | Out-String | Write-Host
     $first = $found[0]
     $OciArch = $first.Arch
     Write-Host ('First oci.dll (expected to be loaded): {0} [{1}, {2}]' -f $first.Path, $first.Arch, $first.Version)
     if ($first.Arch -ne $CliArch) {
-        Write-Warning ('The first oci.dll is {0}, but duckdb.exe is {1}. They must match. ' -f $first.Arch, $CliArch +
-            'Put the matching Instant Client first on PATH, or set $env:DUCKDB_ORACLE_CLIENT_LIB_DIR to its directory.')
-        Add-Result 'oci.dll' 'WARN' ('first is ' + $first.Arch + ' (duckdb.exe is ' + $CliArch + '): ' + $first.Path)
+        $msg = ('The first oci.dll is {0}, but duckdb.exe is {1}. They must match. ' -f $first.Arch, $CliArch) +
+            'Put the matching Instant Client first on PATH, or set $env:DUCKDB_ORACLE_CLIENT_LIB_DIR to its directory.'
+        Write-Warning $msg
+        Add-Result 'oci.dll' $ociBad ('first is ' + $first.Arch + ' (duckdb.exe is ' + $CliArch + '): ' + $first.Path + ' - ' + $msg)
     } else {
         Add-Result 'oci.dll' 'PASS' ($first.Path + ' ' + $first.Version + ' [' + $first.Arch + ']')
     }
@@ -325,7 +395,7 @@ if ($HostArch -eq 'ARM64' -and $CliArch -eq 'x64') {
 }
 if ($archProblems.Count -gt 0) {
     foreach ($m in $archProblems) { Write-Warning $m }
-    Add-Result 'architecture' 'WARN' ($archProblems -join ' | ')
+    Add-Result 'architecture' $(if ($Strict) { 'FAIL' } else { 'WARN' }) ($archProblems -join ' | ')
 } else {
     Add-Result 'architecture' 'PASS' ('host ' + $HostArch + ', duckdb/extension ' + $CliArch + $(if ($OciArch) { ', oci.dll ' + $OciArch } else { '' }))
 }
@@ -359,143 +429,148 @@ SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'duckdb_oracle';
 if ($r.Code -eq 0 -and $r.Out.Trim() -eq 'true') { Add-Result 'loaded=true' 'PASS' '' }
 else { Add-Result 'loaded=true' 'FAIL' ("exit " + (Format-ExitCode $r.Code) + ", output: " + $r.Out.Trim()) }
 
-# Oracle SQL covering the mapped types, built from literals / CAST on dual.
-$typesSql = @"
-SELECT
-  CAST(42 AS NUMBER(10))                                  AS num_int,
-  CAST(12345.67 AS NUMBER(12,2))                          AS num_dec,
-  CAST(123456789012345678901234 AS NUMBER(30))            AS num_big,
-  CAST(1.5 AS NUMBER)                                     AS num_plain,
-  CAST(1.5 AS BINARY_DOUBLE)                              AS bin_double,
-  CAST(2.5 AS BINARY_FLOAT)                               AS bin_float,
-  CAST('hello' AS VARCHAR2(20))                           AS vc,
-  CAST(UNISTR('gr\00FC\00DFe') AS NVARCHAR2(20))          AS nvc,
-  CAST('abc' AS CHAR(5))                                  AS ch,
-  CAST(UNISTR('xyz') AS NCHAR(5))                         AS nch,
-  TO_CLOB('clob text')                                    AS clob_col,
-  TO_NCLOB('nclob text')                                  AS nclob_col,
-  DATE '2024-02-29'                                       AS d,
-  TIMESTAMP '2024-02-29 13:45:30.123456'                  AS ts,
-  TIMESTAMP '2024-01-01 10:00:00 +05:30'                  AS tstz,
-  CAST(TIMESTAMP '2024-01-01 10:00:00 +05:30' AS TIMESTAMP WITH LOCAL TIME ZONE) AS tsltz,
-  HEXTORAW('DEADBEEF')                                    AS raw_col,
-  TO_BLOB(HEXTORAW('CAFEBABE'))                           AS blob_col,
-  INTERVAL '3 04:05:06.007' DAY TO SECOND                 AS ids,
-  INTERVAL '2-3' YEAR TO MONTH                            AS iym,
-  CAST(NULL AS NUMBER(10))                                AS null_int,
-  CAST(NULL AS NUMBER(12,2))                              AS null_dec,
-  CAST(NULL AS VARCHAR2(10))                              AS null_vc,
-  CAST(NULL AS DATE)                                      AS null_date,
-  CAST(NULL AS RAW(4))                                    AS null_raw,
-  ROWID                                                   AS rid
-FROM dual
-"@
-
-# --- 3. Oracle ---------------------------------------------------------------
-if ($SkipOracle) {
-    Write-Section '3. Oracle queries: skipped (-SkipOracle)'
-    Add-Result 'oracle queries' 'SKIP' '-SkipOracle'
-} elseif (-not $env:ORACLE_PASSWORD) {
-    Write-Section '3. Oracle queries: skipped'
-    Write-Warning 'ORACLE_PASSWORD is not set. Set it without echoing (see Get-Help .\test-windows.ps1) and re-run.'
-    Add-Result 'oracle queries' 'SKIP' 'ORACLE_PASSWORD not set'
-} else {
-    $q = "oracle_query($(SqlLit $Dsn), {0}, user := $(SqlLit $User))"
-    Write-Host ("DSN: {0}   user: {1}   password: from `$env:ORACLE_PASSWORD (not shown)" -f $Dsn, $User)
-
-    Write-Section '3a. SELECT * FROM dual'
-    $r = Invoke-DuckDB -Name 'dual' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-SELECT * FROM $($q -f (SqlLit 'SELECT * FROM dual'));
-"@
-    Add-Result 'SELECT * FROM dual' $(if ($r.Code -eq 0) { 'PASS' } else { 'FAIL' }) (Format-ExitCode $r.Code)
-
-    $tq = $q -f (SqlLit $typesSql)
-
-    Write-Section '3b. Type coverage: DESCRIBE, values, per-column checks'
-    $r = Invoke-DuckDB -Name 'types' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-.mode box
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM $tq);
-.mode line
-SELECT * FROM $tq;
-SELECT
-  num_int = 42                                          AS ok_num_int,
-  num_dec = 12345.67                                    AS ok_num_dec,
-  num_big = 123456789012345678901234                    AS ok_num_big,
-  num_plain = 1.5                                       AS ok_num_plain,
-  bin_double = 1.5                                      AS ok_bin_double,
-  bin_float = 2.5                                       AS ok_bin_float,
-  vc = 'hello'                                          AS ok_vc,
-  nvc = 'gr' || chr(252) || chr(223) || 'e'             AS ok_nvc,
-  ch = 'abc  '                                          AS ok_ch,
-  rtrim(nch) = 'xyz'                                    AS ok_nch,
-  clob_col = 'clob text'                                AS ok_clob,
-  nclob_col = 'nclob text'                              AS ok_nclob,
-  d = TIMESTAMP '2024-02-29 00:00:00'                   AS ok_date,
-  ts = TIMESTAMP '2024-02-29 13:45:30.123456'           AS ok_ts,
-  tstz = TIMESTAMPTZ '2024-01-01 04:30:00+00'           AS ok_tstz,
-  tsltz = TIMESTAMPTZ '2024-01-01 04:30:00+00'          AS ok_tsltz,
-  raw_col = '\xDE\xAD\xBE\xEF'::BLOB                    AS ok_raw,
-  blob_col = '\xCA\xFE\xBA\xBE'::BLOB                   AS ok_blob,
-  ids = INTERVAL '3 days 04:05:06.007'                  AS ok_interval_ds,
-  iym = INTERVAL '27 months'                            AS ok_interval_ym,
-  null_int IS NULL AND null_dec IS NULL AND null_vc IS NULL AND null_date IS NULL AND null_raw IS NULL AS ok_nulls,
-  length(rid) >= 18                                     AS ok_rowid
-FROM $tq;
-"@
-    $okLines = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^\s*ok_\w+\s*=' })
-    $bad = @($okLines | Where-Object { $_ -notmatch '=\s*true\s*$' })
-    if ($r.Code -eq 0 -and $okLines.Count -gt 0 -and $bad.Count -eq 0) { Add-Result 'type coverage' 'PASS' ("{0} checks true" -f $okLines.Count) }
-    else { Add-Result 'type coverage' 'FAIL' ("exit " + (Format-ExitCode $r.Code) + "; not true: " + (($bad | ForEach-Object { $_.Trim() }) -join '; ')) }
-
-    Write-Section '3c. Multi-batch fetch (5000 rows) and early termination (LIMIT)'
-    $r = Invoke-DuckDB -Name 'batches' -Unsigned -ExtraArgs @('-csv') -Sql @"
-LOAD $(SqlLit $ExtSql);
-SELECT count(*) AS n, sum(n) AS s, count(*) FILTER (WHERE n IS NULL) AS nulls FROM $($q -f (SqlLit 'SELECT CAST(level AS NUMBER(10)) AS n FROM dual CONNECT BY level <= 5000'));
-SELECT * FROM $($q -f (SqlLit 'SELECT CAST(level AS NUMBER(10)) AS n FROM dual CONNECT BY level <= 100000')) LIMIT 3;
-SELECT count(*) AS nulls_roundtrip FROM $($q -f (SqlLit 'SELECT CASE WHEN MOD(level, 2) = 0 THEN NULL ELSE level END AS v FROM dual CONNECT BY level <= 3000')) WHERE v IS NULL;
-"@
-    $ok = $r.Code -eq 0 -and $r.Out -match '5000,12502500,0' -and $r.Out -match '(?m)^1500\s*$'
-    Add-Result 'batches/LIMIT/NULLs' $(if ($ok) { 'PASS' } else { 'FAIL' }) (Format-ExitCode $r.Code)
-
-    Write-Section '3d. Error path: unreachable DSN must give a DuckDB error with ORA-/DPI-, not a crash'
-    $r = Invoke-DuckDB -Name 'unreachable' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'SELECT * FROM dual', user := $(SqlLit $User));
-"@
-    $ok = (-not $r.TimedOut) -and $r.Code -eq 1 -and (($r.Out + $r.Err) -match '(ORA|DPI)-\d+')
-    Add-Result 'unreachable DSN error' $(if ($ok) { 'PASS' } else { 'FAIL' }) (Format-ExitCode $r.Code)
+# --- end-to-end SQL tests (test/e2e) ----------------------------------------
+# Each *.sql file in test/e2e is run in its own DuckDB process, after LOADing the extension. They are shared with
+# the CI workflow (e2e-oracle19c.yml), which runs this script, so local and CI runs are identical.
+#   @DSN@ in the SQL is replaced by the connect string. The login comes from ORACLE_USER / ORACLE_PASSWORD in the
+#   environment; no password ever appears in SQL or on a command line.
+# Header comments in a test file control how it is judged:
+#   -- e2e: <title>              shown in the log
+#   -- expect-error: <regex>     the run must fail with a DuckDB error (exit 1) whose output matches; repeatable.
+#                                The file starts with ".bail off" so later statements still run, which is how a test
+#                                shows that the process survives Oracle errors. A crash or hang fails.
+#   -- expect-output: <regex>    the output must match; repeatable
+#   -- timeout: <seconds>        per-file limit (default: -TimeoutSeconds)
+#   -- optional                  a failure is a warning (for example when an account may not see a view)
+# Without expect-error a file passes if DuckDB exits 0; its SQL asserts with error(), which fails the run.
+function Read-E2EDirectives([string]$Text) {
+    $d = [pscustomobject]@{ Title = ''; ExpectError = @(); ExpectOutput = @(); Timeout = 0; Optional = $false }
+    foreach ($line in ($Text -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -eq '') { continue }
+        if (-not $t.StartsWith('--')) { break }
+        if ($t -match '^--\s*e2e:\s*(.+)$') { $d.Title = $Matches[1].Trim() }
+        elseif ($t -match '^--\s*expect-error:\s*(.+)$') { $d.ExpectError += $Matches[1].Trim() }
+        elseif ($t -match '^--\s*expect-output:\s*(.+)$') { $d.ExpectOutput += $Matches[1].Trim() }
+        elseif ($t -match '^--\s*timeout:\s*(\d+)\s*$') { $d.Timeout = [int]$Matches[1] }
+        elseif ($t -match '^--\s*optional\s*$') { $d.Optional = $true }
+    }
+    return $d
 }
 
-# --- 4. optional: Oracle 23ai / 26ai database --------------------------------
+function Invoke-E2ESuite {
+    param([string]$Dir, [string]$Group, [string]$SuiteDsn)
+    $files = @(Get-ChildItem -LiteralPath $Dir -Filter '*.sql' -File | Sort-Object Name)
+    if ($files.Count -eq 0) { Add-Result "e2e $Group" 'FAIL' "no .sql files in $Dir"; return }
+    foreach ($f in $files) {
+        $text = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8)
+        $d = Read-E2EDirectives $text
+        $title = $(if ($d.Title) { $d.Title } else { $f.BaseName })
+        $name = ('{0}/{1}' -f $Group, $f.BaseName)
+        Write-Section ('e2e {0}: {1}' -f $name, $title)
+        $sql = ('LOAD {0};' -f (SqlLit $ExtSql)) + "`n" + $text.Replace('@DSN@', $SuiteDsn.Replace("'", "''"))
+        $timeout = $(if ($d.Timeout -gt 0) { $d.Timeout } else { $TimeoutSeconds })
+        $r = Invoke-DuckDB -Name ('e2e-' + $Group + '-' + $f.BaseName) -Unsigned -Sql $sql -Timeout $timeout
+        $combined = $r.Out + "`n" + $r.Err
+        $problems = @()
+        if ($r.TimedOut) { $problems += 'TIMEOUT (hang)' }
+        elseif ($d.ExpectError.Count -gt 0) {
+            if ($r.Code -ne 1) { $problems += ('expected a DuckDB error (exit code 1), got exit code ' + (Format-ExitCode $r.Code)) }
+        }
+        elseif ($r.Code -ne 0) { $problems += ('exit code ' + (Format-ExitCode $r.Code)) }
+        foreach ($rx in (@($d.ExpectError) + @($d.ExpectOutput))) {
+            if ($combined -notmatch $rx) { $problems += ('output does not match /' + $rx + '/') }
+        }
+        if ($r.Leaked) { $problems += 'THE PASSWORD APPEARED IN THE OUTPUT (it is redacted in this log)' }
+        $failedChecks = @($r.Err -split "`r?`n" | Where-Object { $_ -match 'FAILED:' } | ForEach-Object { $_.Trim() })
+        $status = $(if ($problems.Count -eq 0) { 'PASS' } elseif ($d.Optional) { 'WARN' } else { 'FAIL' })
+        $detail = $(if ($problems.Count -eq 0) { (Format-ExitCode $r.Code) } else { ($problems + $failedChecks) -join '; ' })
+        Add-Result ('e2e ' + $name) $status $detail
+    }
+}
+
+function Wait-ForDatabase([string]$WaitDsn, [int]$Seconds) {
+    # Polls oracle_query('SELECT 1 FROM dual') through the extension until it succeeds or the time is up.
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $attempt = 0
+    $last = ''
+    $sql = ('LOAD {0};' -f (SqlLit $ExtSql)) + "`n" + ("SELECT * FROM oracle_query({0}, 'SELECT 1 FROM dual');" -f (SqlLit $WaitDsn))
+    Write-Host ("Waiting up to {0}s for the database at {1} ..." -f $Seconds, $WaitDsn)
+    while ($true) {
+        $attempt++
+        $r = Invoke-DuckDB -Name 'database-ready' -Unsigned -Sql $sql -Timeout 90 -Quiet
+        if ($r.Code -eq 0 -and -not $r.TimedOut) {
+            Write-Host ("Database is ready (attempt {0})." -f $attempt)
+            return $true
+        }
+        $last = (($r.Err + "`n" + $r.Out) -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($r.TimedOut) { $last = 'the attempt itself timed out' }
+        if ((Get-Date) -ge $deadline) { break }
+        Write-Host ("  attempt {0}: not ready yet ({1}); retrying in 10s" -f $attempt, $last)
+        Start-Sleep -Seconds 10
+    }
+    Write-Host ("Database did not become ready within {0}s. Last error: {1}" -f $Seconds, $last) -ForegroundColor Red
+    return $false
+}
+
+if ($SkipOracle) {
+    Write-Section 'Oracle end-to-end tests: skipped (-SkipOracle)'
+    Add-Result 'oracle e2e' 'SKIP' '-SkipOracle'
+} elseif (-not $env:ORACLE_PASSWORD) {
+    Write-Section 'Oracle end-to-end tests: not run'
+    Write-Warning 'ORACLE_PASSWORD is not set. Set it without echoing (see Get-Help .\test-windows.ps1) and re-run.'
+    Add-Result 'oracle e2e' $(if ($Strict) { 'FAIL' } else { 'SKIP' }) 'ORACLE_PASSWORD not set'
+} else {
+    if (-not $E2EDir) { $E2EDir = Join-Path $PSScriptRoot 'test\e2e' }
+    if (-not (Test-Path -LiteralPath $E2EDir)) {
+        Write-Section 'Oracle end-to-end tests: not run'
+        Write-Warning "End-to-end tests not found at $E2EDir (run this script from a repository checkout, or pass -E2EDir)."
+        Add-Result 'oracle e2e' $(if ($Strict) { 'FAIL' } else { 'SKIP' }) "test directory not found: $E2EDir"
+    } else {
+        $env:ORACLE_USER = $User     # the extension reads the login from the environment
+        Write-Host ("DSN: {0}   user: {1}   password: from `$env:ORACLE_PASSWORD (not shown)" -f $Dsn, $User)
+        $ready = $true
+        if ($WaitForDatabase -gt 0) {
+            Write-Section 'Waiting for the database'
+            $ready = Wait-ForDatabase $Dsn $WaitForDatabase
+            Add-Result 'database ready' $(if ($ready) { 'PASS' } else { 'FAIL' }) $(if ($ready) { $Dsn } else { "no answer from $Dsn within ${WaitForDatabase}s" })
+        }
+        if ($ready) { Invoke-E2ESuite -Dir $E2EDir -Group 'oracle' -SuiteDsn $Dsn }
+    }
+}
+
+# --- optional: Oracle 23ai / 26ai database -----------------------------------
 # Skipped unless $env:ORACLE_DSN_23AI is set, e.g. 'localhost:1522/FREEPDB1' for
 #   docker run -d -p 1522:1521 -e ORACLE_PASSWORD=... gvenzl/oracle-free
 # User:     $env:ORACLE_USER_23AI (default SYSTEM)
-# Password: $env:ORACLE_PASSWORD_23AI (falls back to $env:ORACLE_PASSWORD). It is
-#           handed to duckdb.exe only through its environment (ORACLE_PASSWORD),
-#           never on a command line or in a SQL file.
+# Password: $env:ORACLE_PASSWORD_23AI (falls back to $env:ORACLE_PASSWORD). Handed to duckdb.exe only through its
+#           environment (ORACLE_PASSWORD), never on a command line or in a SQL file.
+# Runs the same test/e2e suite against that database, plus test/e2e/23ai when the loaded Oracle client is 23 or newer
+# (BOOLEAN and VECTOR need a 23ai+ client, native JSON 21c+).
 if (-not $env:ORACLE_DSN_23AI) {
-    Write-Section '4. Oracle 23ai/26ai section: skipped (ORACLE_DSN_23AI not set)'
+    Write-Section 'Oracle 23ai/26ai section: skipped (ORACLE_DSN_23AI not set)'
     Add-Result '23ai/26ai section' 'SKIP' 'ORACLE_DSN_23AI not set'
 } else {
     $dsn23 = $env:ORACLE_DSN_23AI
-    $user23 = if ($env:ORACLE_USER_23AI) { $env:ORACLE_USER_23AI } else { 'SYSTEM' }
-    $pw23 = if ($env:ORACLE_PASSWORD_23AI) { $env:ORACLE_PASSWORD_23AI } else { $env:ORACLE_PASSWORD }
+    $user23 = $(if ($env:ORACLE_USER_23AI) { $env:ORACLE_USER_23AI } else { 'SYSTEM' })
+    $pw23 = $(if ($env:ORACLE_PASSWORD_23AI) { $env:ORACLE_PASSWORD_23AI } else { $env:ORACLE_PASSWORD })
+    if (-not $E2EDir) { $E2EDir = Join-Path $PSScriptRoot 'test\e2e' }
     if (-not $pw23) {
-        Write-Section '4. Oracle 23ai/26ai section: skipped'
+        Write-Section 'Oracle 23ai/26ai section: skipped'
         Write-Warning 'Set $env:ORACLE_PASSWORD_23AI (or ORACLE_PASSWORD) for the 23ai/26ai database.'
         Add-Result '23ai/26ai section' 'SKIP' 'no password in environment'
+    } elseif (-not (Test-Path -LiteralPath $E2EDir)) {
+        Add-Result '23ai/26ai section' 'SKIP' "test directory not found: $E2EDir"
     } else {
+        $savedUser = $env:ORACLE_USER
         $savedPw = $env:ORACLE_PASSWORD
         try {
+            $env:ORACLE_USER = $user23
             $env:ORACLE_PASSWORD = $pw23   # inherited by duckdb.exe only
-            $q23 = "oracle_query($(SqlLit $dsn23), {0}, user := $(SqlLit $user23))"
-            Write-Section '4. Oracle 23ai/26ai database'
+            Write-Section 'Oracle 23ai/26ai database'
             Write-Host ("DSN: {0}   user: {1}   password: from environment (not shown)" -f $dsn23, $user23)
 
-            # Which client will be used? VECTOR/BOOLEAN need a 23ai+ client, native JSON 21c+.
-            $r = Invoke-DuckDB -Name 'client23' -Unsigned -ExtraArgs @('-csv', '-noheader') -Sql @"
+            $r = Invoke-DuckDB -Name 'client23' -Unsigned -ExtraArgs @('-csv', '-noheader') -Quiet -Sql @"
 LOAD $(SqlLit $ExtSql);
 SELECT coalesce(client_version, 'none') FROM oracle_client_info();
 "@
@@ -505,79 +580,16 @@ SELECT coalesce(client_version, 'none') FROM oracle_client_info();
             if ($clientVer -match '^(\d+)\.') { $clientMajor = [int]$Matches[1] }
             Write-Host ("Oracle client in use: {0}" -f $clientVer)
 
-            Write-Section '4a. 23ai/26ai: SELECT * FROM dual + server version'
-            $r = Invoke-DuckDB -Name 'dual23' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-SELECT * FROM $($q23 -f (SqlLit 'SELECT * FROM dual'));
-SELECT * FROM $($q23 -f (SqlLit 'SELECT banner_full FROM v$version'));
-"@
-            Add-Result '23ai: dual' $(if ($r.Code -eq 0) { 'PASS' } else { 'FAIL' }) (Format-ExitCode $r.Code)
-
-            Write-Section '4b. 23ai/26ai: 19c type-coverage query must behave identically'
-            $tq23 = $q23 -f (SqlLit $typesSql)
-            $r = Invoke-DuckDB -Name 'types23' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-.mode line
-SELECT num_int = 42 AND num_dec = 12345.67 AND vc = 'hello' AND d = TIMESTAMP '2024-02-29 00:00:00'
-       AND ts = TIMESTAMP '2024-02-29 13:45:30.123456' AND tstz = TIMESTAMPTZ '2024-01-01 04:30:00+00'
-       AND clob_col = 'clob text' AND blob_col = '\xCA\xFE\xBA\xBE'::BLOB AND null_int IS NULL AS ok_19c_types_on_23ai
-FROM $tq23;
-"@
-            $ok = $r.Code -eq 0 -and $r.Out -match 'ok_19c_types_on_23ai\s*=\s*true'
-            Add-Result '23ai: 19c types' $(if ($ok) { 'PASS' } else { 'FAIL' }) (Format-ExitCode $r.Code)
-
+            Invoke-E2ESuite -Dir $E2EDir -Group 'oracle23ai' -SuiteDsn $dsn23
+            $dir23 = Join-Path $E2EDir '23ai'
             if ($clientMajor -lt 23) {
-                Write-Warning ("Client {0} is older than 23ai: skipping BOOLEAN/JSON/VECTOR checks. Put a 23ai/26ai x64 Instant Client first on PATH or set DUCKDB_ORACLE_CLIENT_LIB_DIR." -f $clientVer)
+                Write-Warning ("Client {0} is older than 23ai: skipping BOOLEAN/JSON/VECTOR tests. Put a 23ai/26ai x64 Instant Client first on PATH or set DUCKDB_ORACLE_CLIENT_LIB_DIR." -f $clientVer)
                 Add-Result '23ai: BOOLEAN/JSON/VECTOR' 'SKIP' ("client " + $clientVer + " < 23")
-            } else {
-                $newSql = @"
-SELECT
-  TRUE                                                AS b_true,
-  FALSE                                               AS b_false,
-  CAST(NULL AS BOOLEAN)                               AS b_null,
-  JSON('{"a":1,"b":[true,null,"x"],"c":{"d":1.5}}')   AS j,
-  CAST(NULL AS JSON)                                  AS j_null,
-  TO_VECTOR('[1.5,2,3]', 3, FLOAT32)                  AS v32,
-  TO_VECTOR('[1.5,2,3]', 3, FLOAT64)                  AS v64,
-  TO_VECTOR('[1,-2,3]', 3, INT8)                      AS vi8,
-  CAST(NULL AS VECTOR(3, FLOAT32))                    AS v_null
-FROM dual
-"@
-                $nq = $q23 -f (SqlLit $newSql)
-                Write-Section '4c. 23ai/26ai: BOOLEAN / JSON / VECTOR mapping'
-                $r = Invoke-DuckDB -Name 'new23' -Unsigned -Sql @"
-LOAD $(SqlLit $ExtSql);
-.mode box
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM $nq);
-.mode line
-SELECT * FROM $nq;
-SELECT
-  b_true = true AND b_false = false AND b_null IS NULL                   AS ok_boolean,
-  json_extract(j, '$.a')::INTEGER = 1
-    AND json_extract_string(j, '$.b[2]') = 'x'
-    AND json_extract(j, '$.b[0]')::BOOLEAN = true
-    AND json_extract(j, '$.c.d')::DOUBLE = 1.5                           AS ok_json,
-  j_null IS NULL                                                          AS ok_json_null,
-  v32 = [1.5, 2, 3]::FLOAT[] AND typeof(v32) = 'FLOAT[]'                 AS ok_vector_float32,
-  v64 = [1.5, 2, 3]::DOUBLE[] AND typeof(v64) = 'DOUBLE[]'               AS ok_vector_float64,
-  vi8 = [1, -2, 3]::FLOAT[]                                               AS ok_vector_int8,
-  v_null IS NULL                                                          AS ok_vector_null
-FROM $nq;
-.mode csv
-SELECT count(*) AS n, sum(v[1]) AS s1, sum(v[2]) AS s2, count(*) FILTER (WHERE len(v) = 2) AS len2
-FROM $($q23 -f (SqlLit "SELECT TO_VECTOR('[' || level || ',' || (2*level) || ']', 2, FLOAT32) AS v FROM dual CONNECT BY level <= 3000"));
-"@
-                $okLines = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^\s*ok_\w+\s*=' })
-                $bad = @($okLines | Where-Object { $_ -notmatch '=\s*true\s*$' })
-                # 3000 rows (2 DuckDB chunks): sum(1..3000)=4501500, doubled 9003000
-                $multi = $r.Out -match '3000,4501500\.0,9003000\.0,3000'
-                if ($r.Code -eq 0 -and $okLines.Count -eq 7 -and $bad.Count -eq 0 -and $multi) {
-                    Add-Result '23ai: BOOLEAN/JSON/VECTOR' 'PASS' '7 checks true + 3000-row VECTOR list'
-                } else {
-                    Add-Result '23ai: BOOLEAN/JSON/VECTOR' 'FAIL' ("exit " + (Format-ExitCode $r.Code) + "; multi-chunk=" + $multi + "; not true: " + (($bad | ForEach-Object { $_.Trim() }) -join '; '))
-                }
+            } elseif (Test-Path -LiteralPath $dir23) {
+                Invoke-E2ESuite -Dir $dir23 -Group 'oracle23ai-types' -SuiteDsn $dsn23
             }
         } finally {
+            $env:ORACLE_USER = $savedUser
             $env:ORACLE_PASSWORD = $savedPw
         }
     }
@@ -587,9 +599,13 @@ FROM $($q23 -f (SqlLit "SELECT TO_VECTOR('[' || level || ',' || (2*level) || ']'
 Write-Section 'Summary'
 $Results | Format-Table -AutoSize -Wrap | Out-String | Write-Host
 $failed = @($Results | Where-Object { $_.Status -eq 'FAIL' })
+$exitCode = 0
 if ($failed.Count -gt 0) {
     Write-Host ("{0} step(s) FAILED" -f $failed.Count) -ForegroundColor Red
-    exit 1
+    foreach ($f in $failed) { Write-Host ("  FAILED: {0}: {1}" -f $f.Step, $f.Detail) -ForegroundColor Red }
+    $exitCode = 1
+} else {
+    Write-Host 'All executed steps passed.' -ForegroundColor Green
 }
-Write-Host 'All executed steps passed.' -ForegroundColor Green
-exit 0
+Write-Host ('test-windows.ps1 exit code: ' + (Format-ExitCode $exitCode))
+exit $exitCode

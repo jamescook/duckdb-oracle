@@ -7,7 +7,7 @@ This page is for people who build the extension from source or work on it. If yo
 
 | Component | Version | Where |
 |---|---|---|
-| Zig | **0.15.2** default (CI and `build.zig.zon` `minimum_zig_version`), supported 0.15.2 .. 0.17.x (tested 0.15.2 and 0.17.0) | `build.zig.zon`, CI matrix |
+| Zig | **0.15.2** is the minimum (`build.zig.zon` `minimum_zig_version`) and the default for local builds; supported 0.15.2 .. 0.17.x. `ci.yml` builds with 0.17.0; the manual `zig-0.15.yml` and `windows.yml` also test 0.15.2 | `build.zig.zon`, `ci.yml`, `zig-0.15.yml`, `windows.yml` |
 | DuckDB headers / tested baseline | **v1.5.6** (source_id `069cc9f9b5`) | C API headers vendored in `third_party/duckdb/v1.5.6/` |
 | Target C API version (footer + `get_api`) | **v1.2.0** by default = minimum DuckDB version; `-Dduckdb-version=vX.Y.Z` to change | `build.zig` |
 | ODPI-C | **v26.0.0** (git tag) | `third_party/odpi/` |
@@ -68,16 +68,36 @@ Other test scripts:
 * `tools/timeout-test.sh <duckdb> <zip>`: a silent TCP listener must not hang the session (needs an Instant Client on the library path).
 * `tools/windows-locator-test.sh <duckdb.exe> <zip> <instantclient_dir> [wine]`: the Windows client-library search scenarios
   (non-ASCII directories, current directory, relative `PATH`, 32-bit client, ...). Run under Wine on Linux or on Windows.
-* `tools/live_oracle_test.py`: runs queries against a **real Oracle server** (types, NULLs, `LIMIT`, LOBs, errors, timeouts).
-  CI runs it in the `live-oracle` job against an Oracle Free 23ai container. It needs `ORACLE_DSN`, `ORACLE_USER`,
-  `ORACLE_PASSWORD` and `DUCKDB_ORACLE_EXTENSION` in the environment and the `duckdb` Python wheel.
-* `test-windows.ps1`: the Windows smoke test (stock CLI, `oci.dll` check, optional Oracle container). Put it next to
-  `duckdb_oracle-windows_amd64.zip` and run `.\test-windows.ps1`. It unpacks the zip itself (`-Extension` also accepts a zip). See
-  `Get-Help .\test-windows.ps1 -Full`. Optional 23ai/26ai database (for example
-  `docker run -d -p 1522:1521 -e ORACLE_PASSWORD=... gvenzl/oracle-free`): set `$env:ORACLE_DSN_23AI = 'localhost:1522/FREEPDB1'`,
-  `$env:ORACLE_PASSWORD_23AI` (falls back to `ORACLE_PASSWORD`) and optionally `$env:ORACLE_USER_23AI` (default `SYSTEM`), then rerun
-  the script. Section 4 runs the 19c checks against that server and, if the loaded client is 23ai+, BOOLEAN/JSON/VECTOR checks;
-  with a 19c client it skips them with a warning.
+* `tools/live_oracle_test.py`: a Python script that runs queries against a **real Oracle server** (types, NULLs, `LIMIT`, LOBs,
+  errors, timeouts). Manual only (no workflow runs it). It needs `ORACLE_DSN`, `ORACLE_USER`, `ORACLE_PASSWORD` and
+  `DUCKDB_ORACLE_EXTENSION` in the environment and the `duckdb` Python wheel.
+* `test-windows.ps1`: the Windows test, used both by hand and by CI (`windows.yml`, `e2e-oracle19c.yml`), so local and CI runs are
+  identical. Without Oracle (`-SkipOracle`) it downloads the pinned, checksum-verified DuckDB CLI, unpacks the shipped zip, checks
+  that the CLI does not already contain the extension, shows which `oci.dll` would load, `LOAD`s the extension under its exact
+  shipped file name and runs `oracle_client_info()`. With a database it also runs the end-to-end SQL tests below. Useful switches:
+  `-Strict` (CI mode: skipped Oracle steps, a missing or wrong-architecture `oci.dll` and architecture warnings are failures),
+  `-WaitForDatabase <seconds>`, `-Dsn` / `-User` (default `$env:ORACLE_DSN` / `$env:ORACLE_USER`; the password is read only from
+  `$env:ORACLE_PASSWORD`), `-DuckDB <path>` (use your own CLI instead of downloading one), `-E2EDir`. See `Get-Help .\test-windows.ps1 -Full`.
+  Optional 23ai/26ai database (for example `docker run -d -p 1522:1521 -e ORACLE_PASSWORD=... gvenzl/oracle-free`): set
+  `$env:ORACLE_DSN_23AI = 'localhost:1522/FREEPDB1'`, `$env:ORACLE_PASSWORD_23AI` (falls back to `ORACLE_PASSWORD`) and optionally
+  `$env:ORACLE_USER_23AI` (default `SYSTEM`). It then runs the same tests against that server, plus `test/e2e/23ai` (BOOLEAN, JSON,
+  VECTOR) if the loaded client is 23ai or newer.
+
+### End-to-end SQL tests (`test/e2e`)
+
+Plain `.sql` files, one DuckDB process each, run in file-name order by `test-windows.ps1` against a real database: `SELECT FROM
+dual`, one test per mapped type built from literals and `CAST` on `dual` (NUMBER variants, `BINARY_FLOAT`/`DOUBLE`,
+`VARCHAR2`/`NVARCHAR2`/`CHAR`/`CLOB`, `DATE`, `TIMESTAMP`, time zones, intervals, `RAW`/`BLOB`/`ROWID`), NULLs, a 6000-row query that
+crosses DuckDB vector boundaries, `LIMIT` early termination, and Oracle errors that must surface `ORA-` codes while the process keeps
+running. They need no tables, only `CREATE SESSION`. Conventions:
+
+* `@DSN@` is replaced by the connect string. The login is never in SQL: it comes from `ORACLE_USER` / `ORACLE_PASSWORD`.
+* A test builds a temp table from `oracle_query`, lists named checks one per line, and ends with one statement that calls DuckDB's
+  `error()` naming every failed check. Exit code 0 means every check held.
+* Header comments control the judgement: `-- expect-error: <regex>` (the run must fail with matching output, and the file starts with
+  `.bail off` so later statements still run, which proves the process survives), `-- expect-output: <regex>`,
+  `-- timeout: <seconds>`, `-- optional` (a failure is a warning).
+* `test/e2e/23ai/` holds the tests that need a 23ai/26ai server and client.
 
 ## Distribution: one zip per platform
 
@@ -119,7 +139,7 @@ verified: 0.15.2 and 0.17.0. There are no per-version branches or copies.
   (`b.addTranslateC`), which works the same on all supported versions.
 * Other things that do not exist on 0.17 and so must not be used in new code: the `**` array-repeat operator (use `@splat`),
   `@typeInfo(enum).fields`, and `std.ascii.indexOfIgnoreCase`.
-* CI runs build, unit tests, the stock-DuckDB load test, the client matrix and the SQLLogicTests on both 0.15.2 and 0.17.0.
+* `ci.yml` builds and tests with Zig 0.17 on every push; the manual `zig-0.15.yml` runs the same steps with 0.15.2, and `windows.yml` builds on Windows with both.
 
 ```sh
 zig build && zig build test                                  # default (0.15.2)
@@ -128,15 +148,24 @@ zig build && zig build test                                  # default (0.15.2)
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every push and pull request:
+Exactly four workflows live in `.github/workflows/`. The build and test steps shared by `ci.yml` and `zig-0.15.yml` are one composite
+action, `.github/actions/build-test`, so the two cannot drift apart.
 
-* **build**: on Zig 0.15.2 and 0.17.0: unit tests, all platforms, the verifier's tests and the artifact checks (footer, and for
-  Windows the PE image), every `-Dduckdb-version` in range, the stock-CLI load test with the negative control and the
-  Instant Client matrix (no client, 19.26, latest), the timeout regression, and the SQLLogicTests.
-* **stock-cli-matrix**: the same artifacts loaded into several official DuckDB CLI releases on Linux and Windows.
-* **windows-arm64** and **windows-native-build**: `test-windows.ps1` on Windows ARM64 and a native Windows build.
-* **live-oracle**: `tools/live_oracle_test.py` against an Oracle Free 23ai service container.
-* **windows-locator-wine**: the Windows client-library scenarios under Wine.
+| Workflow | Trigger | Runner | What it checks |
+|---|---|---|---|
+| `ci.yml` | automatic: every push and pull request | `ubuntu-latest`, Zig 0.17 | `zig build test`; builds all five platform targets (Windows and macOS cross-compiled); the artifact verifier's own tests; for each platform the shipped name, metadata footer and, for Windows, the PE image; every `-Dduckdb-version` in range compiles; loads the `linux_amd64` build into the stock DuckDB CLI (pinned version, checksum-verified) with the negative control; SQLLogicTests. **Uploads each platform's shipped zip as the artifact `duckdb_oracle-<platform>`** |
+| `zig-0.15.yml` | manual (`workflow_dispatch`) | `ubuntu-latest`, Zig 0.15.2 | the same steps as `ci.yml`, to keep the compat layer honest; uploads nothing |
+| `windows.yml` | manual | `windows-latest`, Zig 0.15.2 and 0.17 | builds `windows_amd64` natively, then `test-windows.ps1 -SkipOracle` (PowerShell 7 and Windows PowerShell 5.1): downloads the pinned official DuckDB CLI and verifies its checksum, `LOAD`s the extension under its exact shipped file name, `duckdb_extensions()` shows it loaded, `oracle_client_info()` runs |
+| `e2e-oracle19c.yml` | manual, **owner only** (`github.actor == 'jamescook'`) | self-hosted `[self-hosted, windows, oracle19c]` | the real-database end-to-end tests (`test/e2e`) against Oracle 19c, using the build from the latest successful `ci.yml` run on `main`. Setup: [SELF_HOSTED_RUNNER.md](SELF_HOSTED_RUNNER.md) |
+
+The DuckDB CLI version and the SHA-256 of its official release assets are pinned in one file, `tools/duckdb-cli-pins.json`, used by every
+workflow (`tools/fetch-duckdb-cli.sh` on Linux, `test-windows.ps1` on Windows). To move to another DuckDB release, change the version and
+the checksums there (compare them with the digests GitHub shows on the release page).
+
+Checks that used to run in CI and now run only by hand: the Oracle Instant Client matrix (`verify_artifact.py --client DIR`), the
+silent-listener timeout test (`tools/timeout-test.sh`), the Windows client-library scenarios under Wine
+(`tools/windows-locator-test.sh`), the Windows ARM64 runner job, the loads into older DuckDB releases, and
+`tools/live_oracle_test.py` against an Oracle Free container.
 
 ## Project layout
 
@@ -160,10 +189,14 @@ src/arch.zig                 process/host architecture + Windows-on-ARM hints (+
 test/sql/*.test              SQLLogicTests (no-client paths)
 tools/verify_artifact.py     the artifact rules in one place: name, footer, PE, stock-CLI load, negative control, client checks (+ tests)
 tools/windows-locator-test.sh Windows client-locator scenarios with the real Windows duckdb.exe + Instant Client (Wine or Windows)
-tools/                       package.py (zip packaging, owns the shipped name), pe_inspect.py (x64+ARM64), check_footer.py, timeout-test.sh, live_oracle_test.py
-test-windows.ps1             Windows smoke test (stock CLI, oci.dll check, Oracle container)
+tools/                       package.py (zip packaging, owns the shipped name), pe_inspect.py (x64+ARM64), check_footer.py, timeout-test.sh, live_oracle_test.py,
+                             duckdb-cli-pins.json (pinned DuckDB CLI version + checksums), fetch-duckdb-cli.sh, test_ci_config.py (guards the workflow contract)
+test/e2e/                    end-to-end SQL tests run against a real Oracle database by test-windows.ps1 (test/e2e/23ai/ for 23ai/26ai)
+test-windows.ps1             Windows test: pinned stock CLI, oci.dll check, LOAD, and the end-to-end tests (used by hand and by CI)
 third_party/                 vendored DuckDB headers, ODPI-C, metadata script (see third_party/VERSIONS.md)
-.github/workflows/ci.yml     CI (see above)
+.github/workflows/           ci.yml, zig-0.15.yml, windows.yml, e2e-oracle19c.yml (see Continuous integration)
+.github/actions/build-test   the build-and-test steps shared by ci.yml and zig-0.15.yml
+docs/SELF_HOSTED_RUNNER.md   registering the runner for e2e-oracle19c.yml
 docs/dev/REPORT.md           development log of the original verification (history, not user documentation)
 ```
 
