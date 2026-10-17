@@ -181,9 +181,13 @@ architecture of the first `oci.dll` on the search path when that doesn't match t
    ```powershell
    $env:DUCKDB_ORACLE_CLIENT_LIB_DIR = "C:\oracle\instantclient_19_26"
    ```
-   ODPI-C searches for `oci.dll` in this order: `DUCKDB_ORACLE_CLIENT_LIB_DIR` (exclusively, if set), then the
-   extension's own directory, then the normal Windows DLL search (the `duckdb.exe` directory, System32,
-   then `PATH`). If it finds a 32-bit `oci.dll`, it reports this in a `DPI-1047` error.
+   On Windows the extension itself decides which `oci.dll` loads (`src/client_locator.zig`), in this order:
+   `DUCKDB_ORACLE_CLIENT_LIB_DIR` (exclusively, if set), otherwise the extension's own directory, the directory
+   of `duckdb.exe`, then each **absolute** entry of `PATH`. **The current directory and relative `PATH` entries
+   are never searched**, so a stray `oci.dll` in the folder you start DuckDB from is not loaded. An `oci.dll` of the
+   wrong architecture (for example a 32-bit client) is skipped and named in the message, and the search goes on, so
+   the order of a 32-bit and a 64-bit client on `PATH` no longer matters. The path is handled as Unicode, so
+   directories with non-ASCII characters work. `oracle_client_info()` reports where `oci.dll` was loaded from.
 3. **Use a stock DuckDB CLI** (v1.2.0 or newer; v1.5.6 is the tested baseline), download
    `duckdb_oracle-windows_amd64.zip`, and unzip it. It contains exactly `duckdb_oracle.duckdb_extension`;
    keep that name. DuckDB derives the entrypoint symbol from the file name.
@@ -325,7 +329,8 @@ error or the "unsupported Oracle type" message (expected behaviour, not verified
   at startup).
 * `ORA-12541` / `ORA-12514`: the listener or service is unreachable. Check the Docker port mapping and the
   service name (`ORCLPDB1`).
-* To trace how ODPI-C searches for OCI, set `DPI_DEBUG_LEVEL=64` before starting DuckDB.
+* On Windows, the `DPI-1047` text lists what was searched and any skipped `oci.dll` with its architecture. On Linux,
+  set `DPI_DEBUG_LEVEL=64` before starting DuckDB to trace how ODPI-C searches for OCI.
 
 ## Known limitations
 
@@ -371,9 +376,11 @@ src/timeouts.zig             connect/call timeout policy (+ unit tests)
 src/column.zig               what an Oracle column becomes in DuckDB: type plan, fetch cost, value write behind a vector-sink seam (+ tests)
 src/convert.zig              pure value primitives: timestamps, decimals, NUMBER-as-double check, JSON text, VECTOR copy (+ unit tests)
 src/c.zig                    C headers module (src/c_headers.h via b.addTranslateC)
-src/platform.c               loaded OCI library path, host architecture, first oci.dll + its PE machine
+src/client_locator.zig       which oci.dll loads (Windows search policy + diagnostics), behind an OS seam (+ tests with a fake OS)
+src/platform.c               Windows locator primitives (wide-char load, PE machine, directories), loaded OCI path, host architecture, getenv
 src/arch.zig                 process/host architecture + Windows-on-ARM hints (+ unit tests)
 test/sql/*.test              SQLLogicTests (no-client paths)
+tools/windows-locator-test.sh Windows client-locator scenarios with the real Windows duckdb.exe + Instant Client (Wine or Windows)
 tools/                       package.py (zip packaging), shipped-ext.sh, stock-CLI test, per-client matrix, PE inspection (pe_inspect.py, x64+ARM64), footer checker
 test-windows.ps1             Windows smoke test (stock CLI, oci.dll check, Oracle container)
 third_party/                 vendored DuckDB headers, ODPI-C, metadata script (see VERSIONS.md)

@@ -8,9 +8,19 @@ const compat = @import("compat.zig");
 const c = @import("c.zig").c;
 const arch = @import("arch.zig");
 const timeouts = @import("timeouts.zig");
+const locator = @import("client_locator.zig");
 
 var mutex: compat.Mutex = .{};
 var context: ?*c.dpiContext = null;
+/// Windows: architecture of the first oci.dll the locator met (guarded by `mutex`)
+var first_arch_buf: [16]u8 = undefined;
+var first_arch_len: usize = 0;
+var loaded_path: [512]u8 = undefined;
+var loaded_path_len: usize = 0;
+
+extern fn duckdb_oracle_utf8_to_ansi(in: [*:0]const u8, out: [*]u8, outlen: usize) c_int;
+
+const instant_client_url = "https://www.oracle.com/database/technologies/instant-client.html";
 
 pub const odpi_version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ c.DPI_MAJOR_VERSION, c.DPI_MINOR_VERSION, c.DPI_PATCH_LEVEL });
 
@@ -58,24 +68,58 @@ pub fn getContext(msg: *Msg) ?*c.dpiContext {
     var params = std.mem.zeroes(c.dpiContextCreateParams);
     params.defaultDriverName = "duckdb_oracle";
     params.defaultEncoding = "UTF-8";
-    params.loadErrorUrl = "https://www.oracle.com/database/technologies/instant-client.html";
+    params.loadErrorUrl = instant_client_url;
 
     const alloc = std.heap.c_allocator;
     const lib_dir_raw: ?[]u8 = compat.getEnvOwned(alloc, lib_dir_env);
     defer if (lib_dir_raw) |d| alloc.free(d);
+    const lib_dir: ?[]const u8 = if (lib_dir_raw) |d| (if (d.len > 0) d else null) else null;
     var lib_dir_z: ?[:0]u8 = null;
     defer if (lib_dir_z) |d| alloc.free(d);
-    if (lib_dir_raw) |d| {
-        if (d.len > 0) {
-            lib_dir_z = compat.dupeZ(alloc, d) catch null;
-            if (lib_dir_z) |p| params.oracleClientLibDir = p.ptr;
+    var ansi_dir: [1024]u8 = undefined;
+
+    if (comptime arch.this_os == .windows) {
+        // ODPI-C's own Windows loader is ANSI-only and searches the current
+        // directory (client_locator.zig explains). Decide and load here, with the
+        // wide-character API; ODPI-C then finds the module already loaded.
+        var os: locator.WindowsOs = .{};
+        defer os.deinit();
+        const res = locator.locate(&os, lib_dir, arch.process_arch);
+        first_arch_len = if (res.firstArch()) |a| a.len else 0;
+        if (res.firstArch()) |a| @memcpy(first_arch_buf[0..a.len], a);
+        if (res.status != .loaded) {
+            const bits = if (std.mem.eql(u8, arch.process_arch, "x86")) "32" else "64";
+            msg.set("DPI-1047: Cannot locate a {s}-bit Oracle Client library: {s}. See {s} for help", .{ bits, res.detailSlice(), instant_client_url });
+            return null;
         }
+        loaded_path_len = res.pathSlice().len;
+        @memcpy(loaded_path[0..loaded_path_len], res.pathSlice());
+        // With an explicit directory, hand ODPI-C the same directory (as ANSI) so
+        // that its own attempt resolves to the module we just loaded. If the name
+        // is not representable in the ANSI code page, leave it out: ODPI-C then
+        // resolves "oci.dll" by name to the already-loaded module.
+        if (lib_dir) |d| {
+            lib_dir_z = compat.dupeZ(alloc, d) catch null;
+            if (lib_dir_z) |z| {
+                if (duckdb_oracle_utf8_to_ansi(z.ptr, &ansi_dir, ansi_dir.len) != 0) params.oracleClientLibDir = @ptrCast(&ansi_dir);
+            }
+        }
+    } else if (lib_dir) |d| {
+        lib_dir_z = compat.dupeZ(alloc, d) catch null;
+        if (lib_dir_z) |p| params.oracleClientLibDir = p.ptr;
     }
 
     var ctx: ?*c.dpiContext = null;
     var err = std.mem.zeroes(c.dpiErrorInfo);
     if (c.dpiContext_createWithParams(c.DPI_MAJOR_VERSION, c.DPI_MINOR_VERSION, &params, &ctx, &err) != c.DPI_SUCCESS or ctx == null) {
-        msg.set("{s}", .{trimMsg(@ptrCast(err.message), err.messageLength)});
+        const text = trimMsg(@ptrCast(err.message), err.messageLength);
+        if (comptime arch.this_os == .windows) {
+            // oci.dll itself loaded (the locator got that far) but ODPI-C rejected it, e.g.
+            // DPI-1072 when the Instant Client files next to it are missing.
+            msg.set("{s} (oci.dll was loaded from {s}; all Instant Client files, such as oraociei*.dll, must be in that directory)", .{ text, loaded_path[0..loaded_path_len] });
+        } else {
+            msg.set("{s}", .{text});
+        }
         return null;
     }
     context = ctx;
@@ -103,7 +147,6 @@ pub const ClientInfo = struct {
 };
 
 extern fn duckdb_oracle_host_arch(buf: [*]u8, buflen: usize) usize;
-extern fn duckdb_oracle_find_oci(path: [*]u8, pathlen: usize, arch_buf: [*]u8, archlen: usize) usize;
 
 pub fn hostArch(buf: *[32]u8) []const u8 {
     const n = duckdb_oracle_host_arch(buf, buf.len);
@@ -115,11 +158,16 @@ pub fn hostArch(buf: *[32]u8) []const u8 {
 pub fn archHint(out: []u8, client_found: bool) []const u8 {
     var hb: [32]u8 = undefined;
     const host = hostArch(&hb);
-    var path: [1024]u8 = undefined;
     var ab: [16]u8 = undefined;
     var oci_arch: ?[]const u8 = null;
     if (!client_found and arch.this_os == .windows) {
-        if (duckdb_oracle_find_oci(&path, path.len, &ab, ab.len) > 0) oci_arch = std.mem.sliceTo(&ab, 0);
+        // the same resolution the loader used, not a second search
+        mutex.lock();
+        defer mutex.unlock();
+        if (first_arch_len > 0) {
+            @memcpy(ab[0..first_arch_len], first_arch_buf[0..first_arch_len]);
+            oci_arch = ab[0..first_arch_len];
+        }
     }
     return arch.hint(out, arch.this_os, arch.process_arch, host, oci_arch, client_found);
 }
