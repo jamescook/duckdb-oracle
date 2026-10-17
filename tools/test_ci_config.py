@@ -75,6 +75,30 @@ class WorkflowContract(unittest.TestCase):
         self.assertEqual([u["with"]["zig-version"] for u in uses], ["0.15.2"])
         self.assertEqual(uses[0]["with"]["upload-artifacts"], "false")
 
+    def test_ci_runs_the_hosted_oracle_e2e_on_free_23ai_and_xe_21c(self):
+        job = self.wf("ci.yml")["jobs"]["e2e-oracle"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["needs"], "build-test", "it tests the artifact the build job made")
+        images = {m["image"]: m for m in job["strategy"]["matrix"]["include"]}
+        self.assertEqual(sorted(images), ["gvenzl/oracle-free:23-slim", "gvenzl/oracle-xe:21-slim"])
+        self.assertEqual(images["gvenzl/oracle-free:23-slim"]["service"], "FREEPDB1")
+        self.assertEqual(images["gvenzl/oracle-xe:21-slim"]["service"], "XEPDB1")
+        free_dirs = images["gvenzl/oracle-free:23-slim"]["dirs"].split()
+        xe_dirs = images["gvenzl/oracle-xe:21-slim"]["dirs"].split()
+        self.assertIn("test/e2e/spatial", free_dirs)
+        self.assertIn("test/e2e/spatial", xe_dirs)
+        self.assertIn("test/e2e/23ai", free_dirs, "VECTOR and BOOLEAN need 23ai")
+        self.assertNotIn("test/e2e/23ai", xe_dirs, "XE 21c has no VECTOR or BOOLEAN")
+        self.assertEqual(job["services"]["oracle"]["image"], "${{ matrix.image }}")
+        self.assertIn("healthcheck.sh", job["services"]["oracle"]["options"])
+        text = "\n".join(r for _, r in run_blocks({"jobs": {"e2e-oracle": job}}))
+        self.assertIn("tools/fetch-duckdb-cli.sh linux-amd64", text, "the pinned CLI, never whatever is on PATH")
+        self.assertIn("tools/e2e_run.py", text)
+        self.assertRegex(text, r"--wait\s+300")
+        self.assertNotRegex(text, r"docker (pull|login)")
+        download = [s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact")]
+        self.assertEqual(download[0]["with"]["name"], "duckdb_oracle-linux_amd64")
+
     def test_windows_workflow_runs_on_windows_latest_with_both_zig_versions(self):
         job = self.wf("windows.yml")["jobs"]["windows"]
         self.assertEqual(job["runs-on"], "windows-latest")
@@ -148,7 +172,7 @@ class WorkflowContract(unittest.TestCase):
     def test_e2e_takes_the_windows_build_from_the_latest_successful_ci_run_on_main(self):
         doc = self.wf("e2e-oracle19c.yml")
         text = "\n".join(r for _, r in run_blocks(doc))
-        self.assertIn("workflows/ci.yml/runs?branch=main&event=push&status=success", text)
+        self.assertIn("workflows/ci.yml/runs?branch=main&exclude_pull_requests=true&status=success", text)
         steps = doc["jobs"]["e2e"]["steps"]
         dl = [s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact")]
         self.assertEqual(len(dl), 1)
@@ -159,8 +183,8 @@ class WorkflowContract(unittest.TestCase):
         # The binary is loaded into duckdb.exe on the machine that holds the database credentials. "branch=main" alone also
         # matches a pull request from a fork's branch called main (and a tag called main), whose artifact anyone can produce.
         text = "\n".join(r for _, r in run_blocks(self.wf("e2e-oracle19c.yml")))
-        self.assertIn("event=push", text, "ask the API for push runs only")
-        self.assertRegex(text, r"\$run\.event -ne 'push'", "re-check the event of every run the API returned")
+        self.assertIn("exclude_pull_requests=true", text, "never let pull-request runs into the result list")
+        self.assertRegex(text, r"@\('push', 'workflow_dispatch'\) -notcontains \$run\.event", "re-check the event of every run the API returned")
         self.assertRegex(text, r"\$run\.head_repository\.full_name -ne \$env:GITHUB_REPOSITORY", "re-check that the run is from this repository")
         self.assertRegex(text, r"compare/main\.\.\.\$\(\$run\.head_sha\)", "check that the built commit is on main")
         self.assertRegex(text, r"@\('identical', 'behind'\) -notcontains \$cmp\.status",

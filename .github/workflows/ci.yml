@@ -24,3 +24,64 @@ jobs:
         with:
           zig-version: 0.17.0
           upload-artifacts: 'true'
+
+  # Real-database end-to-end tests on hosted runners: the Linux build, loaded into the stock (pinned) DuckDB CLI,
+  # against Oracle Database Free 23ai (VECTOR, spatial) and Oracle Database XE 21c. test/e2e/**/*.sql are the
+  # tests; tools/e2e_run.py runs them. The database runs as a service container that GitHub starts and
+  # health-checks before the first step. The password is for a throw-away container on the runner, not a secret.
+  e2e-oracle:
+    name: E2E ${{ matrix.name }}
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Oracle Free 23ai
+            image: gvenzl/oracle-free:23-slim
+            service: FREEPDB1
+            dirs: test/e2e test/e2e/spatial test/e2e/23ai
+          - name: Oracle XE 21c
+            image: gvenzl/oracle-xe:21-slim
+            service: XEPDB1
+            dirs: test/e2e test/e2e/spatial
+    services:
+      oracle:
+        image: ${{ matrix.image }}
+        env:
+          ORACLE_PASSWORD: ci-only-Oracle-1
+          APP_USER: e2e_app
+          APP_USER_PASSWORD: ci-only-Oracle-1
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 60
+    env:
+      SERVICE: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: duckdb_oracle-linux_amd64
+          path: artifacts
+      # The pinned, checksum-verified DuckDB CLI; the extension exactly as shipped (from the zip); the newest
+      # Instant Client (23ai generation, which understands VECTOR and BOOLEAN) plus SQL*Plus.
+      - name: Install the CLI, the extension and Oracle Instant Client
+        run: |
+          set -euo pipefail
+          duckdb=$(tools/fetch-duckdb-cli.sh linux-amd64 "$RUNNER_TEMP/duckdb-cli")
+          ext=$(python3 tools/verify_artifact.py extract "$PWD/artifacts/duckdb_oracle-linux_amd64.zip" | tail -1)
+          ic=$(tools/install-instantclient-linux.sh "$RUNNER_TEMP/ic")
+          { echo "DUCKDB=$duckdb"; echo "EXTENSION=$ext"; echo "IC_DIR=$ic"; } >> "$GITHUB_ENV"
+      - name: End-to-end tests
+        env:
+          ORACLE_USER: e2e_app
+          ORACLE_PASSWORD: ci-only-Oracle-1
+          E2E_DIRS: ${{ matrix.dirs }}
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$IC_DIR"
+          read -ra dirs <<< "$E2E_DIRS"
+          python3 tools/e2e_run.py --duckdb "$DUCKDB" --extension "$EXTENSION" \
+            --dsn "localhost:1521/$SERVICE" --wait 300 "${dirs[@]}"

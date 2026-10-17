@@ -12,6 +12,7 @@ const arch = @import("arch.zig");
 const timeouts = @import("timeouts.zig");
 const cursor_mod = @import("cursor.zig");
 const session_mod = @import("session.zig");
+const sqlgen = @import("sqlgen.zig");
 const OdpiBackend = @import("odpi_backend.zig").OdpiBackend;
 const OdpiReader = @import("odpi_backend.zig").OdpiReader;
 
@@ -84,15 +85,10 @@ fn logicalType(t: c.duckdb_type) c.duckdb_logical_type {
     return duck("duckdb_create_logical_type")(t);
 }
 
-fn registerOracleQuery(conn: c.duckdb_connection) bool {
-    var tf = duck("duckdb_create_table_function")();
-    defer duck("duckdb_destroy_table_function")(&tf);
-    duck("duckdb_table_function_set_name")(tf, "oracle_query");
-
+/// The named parameters every Oracle table function accepts (connection, timeouts, type options).
+fn addCommonParams(tf: c.duckdb_table_function) void {
     var vt = logicalType(c.DUCKDB_TYPE_VARCHAR);
     defer duck("duckdb_destroy_logical_type")(&vt);
-    duck("duckdb_table_function_add_parameter")(tf, vt); // dsn
-    duck("duckdb_table_function_add_parameter")(tf, vt); // sql
     duck("duckdb_table_function_add_named_parameter")(tf, "user", vt);
     // No `password` parameter on purpose: DuckDB echoes the failing SQL text
     // (literals included) in error messages and the CLI keeps a history, so a
@@ -103,12 +99,31 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     duck("duckdb_table_function_add_named_parameter")(tf, "auth", vt);
     // 'double' (default, checked) | 'lossy_double' | 'varchar': see column.NumberMode
     duck("duckdb_table_function_add_named_parameter")(tf, "unconstrained_number", vt);
+    // 'wkb' (default, BLOB) | 'wkt' (VARCHAR): what SDO_GEOMETRY columns become
+    duck("duckdb_table_function_add_named_parameter")(tf, "geometry", vt);
 
     // Seconds; 0 disables. See timeouts.zig for why these exist.
     var vi = logicalType(c.DUCKDB_TYPE_BIGINT);
     defer duck("duckdb_destroy_logical_type")(&vi);
     duck("duckdb_table_function_add_named_parameter")(tf, "connect_timeout", vi);
     duck("duckdb_table_function_add_named_parameter")(tf, "timeout", vi);
+
+    // true: every geometry column is followed by a BIGINT `<name>_srid` column
+    var vb = logicalType(c.DUCKDB_TYPE_BOOLEAN);
+    defer duck("duckdb_destroy_logical_type")(&vb);
+    duck("duckdb_table_function_add_named_parameter")(tf, "geometry_srid", vb);
+}
+
+fn registerOracleQuery(conn: c.duckdb_connection) bool {
+    var tf = duck("duckdb_create_table_function")();
+    defer duck("duckdb_destroy_table_function")(&tf);
+    duck("duckdb_table_function_set_name")(tf, "oracle_query");
+
+    var vt = logicalType(c.DUCKDB_TYPE_VARCHAR);
+    defer duck("duckdb_destroy_logical_type")(&vt);
+    duck("duckdb_table_function_add_parameter")(tf, vt); // dsn
+    duck("duckdb_table_function_add_parameter")(tf, vt); // sql
+    addCommonParams(tf);
 
     duck("duckdb_table_function_set_bind")(tf, queryBind);
     duck("duckdb_table_function_set_init")(tf, queryInit);
@@ -154,17 +169,17 @@ fn hasNamedParam(info: c.duckdb_bind_info, name: [*:0]const u8) bool {
 }
 
 /// Named BIGINT parameter holding a number of seconds in [0, max_call_secs].
-fn secondsParam(info: c.duckdb_bind_info, msg: *Msg, comptime name: [:0]const u8, default: u32) !u32 {
+fn secondsParam(info: c.duckdb_bind_info, msg: *Msg, comptime fname: []const u8, comptime name: [:0]const u8, default: u32) !u32 {
     var v = duck("duckdb_bind_get_named_parameter")(info, name.ptr);
     if (v == null) return default;
     defer duck("duckdb_destroy_value")(&v);
     if (duck("duckdb_is_null_value")(v)) {
-        msg.set("duckdb_oracle: oracle_query: " ++ name ++ " must not be NULL", .{});
+        msg.set("duckdb_oracle: " ++ fname ++ ": " ++ name ++ " must not be NULL", .{});
         return error.Bind;
     }
     const n = duck("duckdb_get_int64")(v);
     if (n < 0 or n > timeouts.max_call_secs) {
-        msg.set("duckdb_oracle: oracle_query: " ++ name ++ " must be between 0 and {d} seconds (0 = no limit), got {d}", .{ timeouts.max_call_secs, n });
+        msg.set("duckdb_oracle: " ++ fname ++ ": " ++ name ++ " must be between 0 and {d} seconds (0 = no limit), got {d}", .{ timeouts.max_call_secs, n });
         return error.Bind;
     }
     return @intCast(n);
@@ -218,6 +233,85 @@ fn destroyQueryBind(p: ?*anyopaque) callconv(.c) void {
     if (p) |ptr| @as(*QueryBind, @ptrCast(@alignCast(ptr))).destroy();
 }
 
+/// The options every Oracle table function reads from its named parameters.
+const Options = struct {
+    user: ?[]u8 = null,
+    password_env: ?[]u8 = null,
+    auth: session_mod.Auth = .password,
+    number_mode: column.NumberMode = .double,
+    connect_secs: u32 = timeouts.default_connect_secs,
+    call_secs: u32 = timeouts.default_call_secs,
+    geometry: sqlgen.GeometryMode = .wkb,
+    geometry_srid: bool = false,
+
+    fn deinit(self: *Options) void {
+        if (self.user) |u| alloc.free(u);
+        if (self.password_env) |v| alloc.free(v);
+    }
+};
+
+/// A named VARCHAR parameter that, when given, must not be NULL. Owned; null when not given.
+fn requiredNamed(info: c.duckdb_bind_info, msg: *Msg, comptime fname: []const u8, comptime name: [:0]const u8) !?[]u8 {
+    if (!hasNamedParam(info, name)) return null;
+    return namedParam(info, name) orelse {
+        msg.set("duckdb_oracle: " ++ fname ++ ": " ++ name ++ " must not be NULL", .{});
+        return error.Bind;
+    };
+}
+
+fn readOptions(info: c.duckdb_bind_info, msg: *Msg, comptime fname: []const u8) !Options {
+    var o: Options = .{};
+    errdefer o.deinit();
+
+    // Credentials: `user := ...`, `password_env := ...`, `auth := ...` (session.zig applies the policy)
+    o.user = namedParam(info, "user");
+    o.password_env = try requiredNamed(info, msg, fname, "password_env");
+
+    if (try requiredNamed(info, msg, fname, "auth")) |given| {
+        defer alloc.free(given);
+        o.auth = session_mod.Auth.parse(given) orelse {
+            msg.set("duckdb_oracle: " ++ fname ++ ": auth must be 'password' or 'external', got '{s}'", .{given});
+            return error.Bind;
+        };
+    }
+    if (try requiredNamed(info, msg, fname, "unconstrained_number")) |given| {
+        defer alloc.free(given);
+        o.number_mode = column.NumberMode.parse(given) orelse {
+            msg.set("duckdb_oracle: " ++ fname ++ ": unconstrained_number must be 'double', 'lossy_double' or 'varchar', got '{s}'", .{given});
+            return error.Bind;
+        };
+    }
+    if (try requiredNamed(info, msg, fname, "geometry")) |given| {
+        defer alloc.free(given);
+        o.geometry = sqlgen.GeometryMode.parse(given) orelse {
+            msg.set("duckdb_oracle: " ++ fname ++ ": geometry must be 'wkb' or 'wkt', got '{s}'", .{given});
+            return error.Bind;
+        };
+    }
+    if (hasNamedParam(info, "geometry_srid")) {
+        var v = duck("duckdb_bind_get_named_parameter")(info, "geometry_srid");
+        defer duck("duckdb_destroy_value")(&v);
+        if (duck("duckdb_is_null_value")(v)) {
+            msg.set("duckdb_oracle: " ++ fname ++ ": geometry_srid must not be NULL", .{});
+            return error.Bind;
+        }
+        o.geometry_srid = duck("duckdb_get_bool")(v);
+    }
+    o.connect_secs = try secondsParam(info, msg, fname, "connect_timeout", timeouts.default_connect_secs);
+    o.call_secs = try secondsParam(info, msg, fname, "timeout", timeouts.default_call_secs);
+    return o;
+}
+
+/// Connect: credentials, client library, timeouts.
+fn openSession(dsn: []const u8, o: *const Options, msg: *Msg) !session_mod.Session {
+    return session_mod.Session.open(alloc, .{
+        .dsn = dsn,
+        .creds = .{ .user = o.user, .password_env = o.password_env, .auth = o.auth },
+        .connect_secs = o.connect_secs,
+        .call_secs = o.call_secs,
+    }, msg);
+}
+
 fn queryBind(info: c.duckdb_bind_info) callconv(.c) void {
     var msg: Msg = .{};
     queryBindImpl(info, &msg) catch {
@@ -243,53 +337,15 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     };
     defer alloc.free(sql_prepared);
 
-    // Credentials: `user := ...`, `password_env := ...`, `auth := ...` (session.zig applies the policy)
-    const user_param = namedParam(info, "user");
-    defer if (user_param) |u| alloc.free(u);
-    var pw_env_param: ?[]u8 = null;
-    defer if (pw_env_param) |v| alloc.free(v);
-    if (hasNamedParam(info, "password_env")) {
-        pw_env_param = namedParam(info, "password_env") orelse {
-            msg.set("duckdb_oracle: oracle_query: password_env must not be NULL", .{});
-            return error.Bind;
-        };
-    }
-    var auth: session_mod.Auth = .password;
-    if (hasNamedParam(info, "auth")) {
-        const given = namedParam(info, "auth") orelse {
-            msg.set("duckdb_oracle: oracle_query: auth must not be NULL", .{});
-            return error.Bind;
-        };
-        defer alloc.free(given);
-        auth = session_mod.Auth.parse(given) orelse {
-            msg.set("duckdb_oracle: oracle_query: auth must be 'password' or 'external', got '{s}'", .{given});
-            return error.Bind;
-        };
-    }
+    var opts = try readOptions(info, msg, "oracle_query");
+    defer opts.deinit();
+    const sess = try openSession(dsn, &opts, msg);
+    try bindSession(info, msg, sess, sql_prepared, &opts);
+}
 
-    var number_mode: column.NumberMode = .double;
-    if (hasNamedParam(info, "unconstrained_number")) {
-        const given = namedParam(info, "unconstrained_number") orelse {
-            msg.set("duckdb_oracle: oracle_query: unconstrained_number must not be NULL", .{});
-            return error.Bind;
-        };
-        defer alloc.free(given);
-        number_mode = column.NumberMode.parse(given) orelse {
-            msg.set("duckdb_oracle: oracle_query: unconstrained_number must be 'double', 'lossy_double' or 'varchar', got '{s}'", .{given});
-            return error.Bind;
-        };
-    }
-
-    const connect_secs = try secondsParam(info, msg, "connect_timeout", timeouts.default_connect_secs);
-    const call_secs = try secondsParam(info, msg, "timeout", timeouts.default_call_secs);
-
-    const sess = try session_mod.Session.open(alloc, .{
-        .dsn = dsn,
-        .creds = .{ .user = user_param, .password_env = pw_env_param, .auth = auth },
-        .connect_secs = connect_secs,
-        .call_secs = call_secs,
-    }, msg);
-
+/// Describe `sql_prepared` on `sess`, convert SDO_GEOMETRY columns, plan every column and publish
+/// the bind data. Takes ownership of `sess`: it is closed on every failure and by the bind data.
+fn bindSession(info: c.duckdb_bind_info, msg: *Msg, sess: session_mod.Session, sql_prepared: []const u8, opts: *const Options) !void {
     const bind = alloc.create(QueryBind) catch {
         sess.close();
         return error.OutOfMemory;
@@ -300,17 +356,56 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
 
     var desc = try sess.describe(alloc, sql_prepared, msg);
     defer desc.deinit(alloc);
-    const ncols: u32 = @intCast(desc.columns.len);
 
+    // SDO_GEOMETRY is an Oracle object type: ODPI-C would have to unpack it attribute by attribute.
+    // Instead the query is wrapped so that Oracle itself returns WKB or WKT, then described again.
+    var wrapped: ?sqlgen.Wrapped = null;
+    defer if (wrapped) |*w| w.deinit(alloc);
+    var desc2: ?session_mod.Description = null;
+    defer if (desc2) |*d| d.deinit(alloc);
+    var used: *session_mod.Description = &desc;
+
+    if (try wrapGeometryColumns(msg, &desc, opts, &wrapped)) {
+        const w = &wrapped.?;
+        desc2 = sess.describe(alloc, w.sql, msg) catch |e| {
+            const base = msg.*;
+            msg.set("{s} | hint: SDO_GEOMETRY columns are converted with {s}, which needs Oracle Locator or Spatial (included in Oracle XE, Free and every Database edition); " ++
+                "to leave a geometry unconverted convert it yourself in the query", .{ base.slice(), opts.geometry.function() });
+            return e;
+        };
+        if (desc2.?.columns.len != w.expect.len) {
+            msg.set("duckdb_oracle: converting SDO_GEOMETRY columns changed the number of columns ({d} vs {d})", .{ w.expect.len, desc2.?.columns.len });
+            return error.Bind;
+        }
+        used = &desc2.?;
+    }
+
+    const ncols: u32 = @intCast(used.columns.len);
     bind.plans = try alloc.alloc(column.Column, ncols);
     bind.names = try alloc.alloc([]u8, ncols);
     @memset(bind.names, &.{}); // destroy() frees every entry, also after a partial failure
-    for (desc.columns, 0..) |ci, col| {
-        const name = ci.name;
-        const plan = column.fromTypeInfo(&ci.type_info, .{ .number = number_mode }) catch {
-            msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, column.oracleTypeName(ci.type_info.oracleTypeNum) });
+    for (used.columns, 0..) |ci, col| {
+        const name: []const u8 = if (wrapped) |w| w.names[col] else ci.name;
+        const plan = column.fromTypeInfo(&ci.type_info, .{ .number = opts.number_mode }) catch {
+            if (ci.isObject()) {
+                msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle object type {s}.{s}; only MDSYS.SDO_GEOMETRY is converted (to WKB/WKT). Select the attributes you need instead, e.g. t.col.attr", .{ col + 1, name, ci.object_schema, ci.object_name });
+            } else {
+                msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, column.oracleTypeName(ci.type_info.oracleTypeNum) });
+            }
             return error.Bind;
         };
+        if (wrapped) |w| {
+            const want: ?column.Kind = switch (w.expect[col]) {
+                .passthrough => null,
+                .wkb => .blob,
+                .wkt => .varchar,
+                .srid => .bigint,
+            };
+            if (want) |k| if (plan.kind != k) {
+                msg.set("duckdb_oracle: column {d} (\"{s}\"): after the geometry conversion Oracle returned {s}, which is not the expected {s}", .{ col + 1, name, column.oracleTypeName(ci.type_info.oracleTypeNum), @tagName(k) });
+                return error.Bind;
+            };
+        }
         bind.plans[col] = plan;
         bind.names[col] = try alloc.dupe(u8, name);
 
@@ -322,10 +417,31 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     }
 
     bind.fetch_rows = column.fetchRows(bind.plans, bind.vector_size, fetch_budget_bytes);
-    bind.sql = desc.sql; // the normalised statement; ownership moves to the bind data
-    desc.sql = &.{};
+    bind.sql = used.sql; // the statement that will run; ownership moves to the bind data
+    used.sql = &.{};
     bind_owned = false;
     duck("duckdb_bind_set_bind_data")(info, bind, destroyQueryBind);
+}
+
+/// If `desc` has SDO_GEOMETRY columns, build the wrapped statement in `out` and return true.
+fn wrapGeometryColumns(msg: *Msg, desc: *const session_mod.Description, opts: *const Options, out: *?sqlgen.Wrapped) !bool {
+    var any = false;
+    const flags = try alloc.alloc(bool, desc.columns.len);
+    defer alloc.free(flags);
+    const names = try alloc.alloc([]const u8, desc.columns.len);
+    defer alloc.free(names);
+    for (desc.columns, 0..) |ci, i| {
+        flags[i] = ci.isObject() and sqlgen.isSdoGeometry(ci.object_schema, ci.object_name);
+        names[i] = ci.name;
+        any = any or flags[i];
+    }
+    if (!any) return false;
+    out.* = sqlgen.wrapGeometry(alloc, desc.sql, names, flags, opts.geometry, opts.geometry_srid) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        msg.set("duckdb_oracle: cannot convert the geometry columns of this query ({s})", .{@errorName(e)});
+        return error.Bind;
+    };
+    return true;
 }
 
 fn columnLogicalType(col: *const column.Column) c.duckdb_logical_type {

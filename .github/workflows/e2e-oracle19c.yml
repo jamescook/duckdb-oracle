@@ -80,8 +80,9 @@ jobs:
       # 1. The windows_amd64 build comes from the latest successful ci.yml run on main, so Zig is not needed here.
       #    This binary is loaded into duckdb.exe on a machine that holds database credentials, so only a build of a
       #    commit that is on main may be chosen. "branch=main" alone is not enough: a pull request from a fork whose
-      #    branch is also called main reports head_branch = main, and so does a tag called main. Hence the event,
-      #    the head repository and the compare check below.
+      #    branch is also called main reports head_branch = main, and so does a tag called main. Hence the exclusion of
+      #    pull-request runs, the event and head repository re-check, and the compare check below. (ci.yml runs on pushes
+      #    to main only when started by hand, so a manual run of ci.yml on main counts as well as a push.)
       - name: Find the latest successful ci.yml run on main that has the windows_amd64 artifact
         id: ci-run
         shell: powershell
@@ -92,11 +93,11 @@ jobs:
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
           $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
-          $runs = Invoke-RestMethod -Headers $h -Uri "$api/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=20"
+          $runs = Invoke-RestMethod -Headers $h -Uri "$api/actions/workflows/ci.yml/runs?branch=main&exclude_pull_requests=true&status=success&per_page=20"
           $runId = $null; $sha = $null
           foreach ($run in @($runs.workflow_runs)) {
-            if ($run.event -ne 'push' -or $run.head_branch -ne 'main' -or $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY) {
-              Write-Host "Skipping run $($run.id): not a push to main of this repository."
+            if (@('push', 'workflow_dispatch') -notcontains $run.event -or $run.head_branch -ne 'main' -or $run.head_repository.full_name -ne $env:GITHUB_REPOSITORY) {
+              Write-Host "Skipping run $($run.id): not a push or manual run on main of this repository."
               continue
             }
             $cmp = Invoke-RestMethod -Headers $h -Uri "$api/compare/main...$($run.head_sha)"

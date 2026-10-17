@@ -85,7 +85,7 @@ Other test scripts:
 
 ### End-to-end SQL tests (`test/e2e`)
 
-Plain `.sql` files, one DuckDB process each, run in file-name order by `test-windows.ps1` against a real database: `SELECT FROM
+Plain `.sql` files, one DuckDB process each, run in file-name order against a real database by `test-windows.ps1` (Windows: the self-hosted runner, or by hand) or by `tools/e2e_run.py` (Linux: the hosted `e2e-oracle` job; both apply the same rules to the same files): `SELECT FROM
 dual`, one test per mapped type built from literals and `CAST` on `dual` (NUMBER variants, `BINARY_FLOAT`/`DOUBLE`,
 `VARCHAR2`/`NVARCHAR2`/`CHAR`/`CLOB`, `DATE`, `TIMESTAMP`, time zones, intervals, `RAW`/`BLOB`/`ROWID`), NULLs, a 6000-row query that
 crosses DuckDB vector boundaries, `LIMIT` early termination, and Oracle errors that must surface `ORA-` codes while the process keeps
@@ -97,7 +97,19 @@ running. They need no tables, only `CREATE SESSION`. Conventions:
 * Header comments control the judgement: `-- expect-error: <regex>` (the run must fail with matching output, and the file starts with
   `.bail off` so later statements still run, which proves the process survives), `-- expect-output: <regex>`,
   `-- timeout: <seconds>`, `-- optional` (a failure is a warning).
-* `test/e2e/23ai/` holds the tests that need a 23ai/26ai server and client.
+* `test/e2e/23ai/` holds the tests that need a 23ai/26ai server and client (`BOOLEAN`, `JSON`, `VECTOR`).
+* `test/e2e/spatial/` holds the `SDO_GEOMETRY` tests. They are built from constructors on `dual` like the others and need Oracle
+  Locator (the first file, `00_probe_locator.sql`, checks for it) and DuckDB's `ST_GeomFromWKB`/`ST_AsText` (core in DuckDB 1.5).
+
+Run them on Linux by hand with the pinned CLI, the extension from the zip and an Instant Client on `LD_LIBRARY_PATH`:
+
+```sh
+export ORACLE_USER=... ORACLE_PASSWORD=...        # the password is read from the environment only
+tools/e2e_run.py --duckdb "$(tools/fetch-duckdb-cli.sh linux-amd64 /tmp/duckdb-cli)" \
+  --extension /path/to/duckdb_oracle.duckdb_extension --dsn localhost:1521/FREEPDB1 --wait 120 \
+  test/e2e test/e2e/spatial
+```
+(`tools/install-instantclient-linux.sh DEST` downloads Instant Client and prints the directory to put on `LD_LIBRARY_PATH`.)
 
 ## Distribution: one zip per platform
 
@@ -153,7 +165,7 @@ action, `.github/actions/build-test`, so the two cannot drift apart.
 
 | Workflow | Trigger | Runner | What it checks |
 |---|---|---|---|
-| `ci.yml` | automatic: every push and pull request | `ubuntu-latest`, Zig 0.17 | `zig build test`; builds all five platform targets (Windows and macOS cross-compiled); the artifact verifier's own tests; for each platform the shipped name, metadata footer and, for Windows, the PE image; every `-Dduckdb-version` in range compiles; loads the `linux_amd64` build into the stock DuckDB CLI (pinned version, checksum-verified) with the negative control; SQLLogicTests. **Uploads each platform's shipped zip as the artifact `duckdb_oracle-<platform>`** |
+| `ci.yml` | automatic on pull requests and on pushes to branches other than `main` (the `branches-ignore: [main]` filter can be removed to bring the push-to-`main` run back); also manual | `ubuntu-latest`, Zig 0.17 | `zig build test`; builds all five platform targets (Windows and macOS cross-compiled); the artifact verifier's own tests; for each platform the shipped name, metadata footer and, for Windows, the PE image; every `-Dduckdb-version` in range compiles; loads the `linux_amd64` build into the stock DuckDB CLI (pinned version, checksum-verified) with the negative control; SQLLogicTests. **Uploads each platform's shipped zip as the artifact `duckdb_oracle-<platform>`**. A second job, `e2e-oracle`, then loads that `linux_amd64` build into the pinned stock CLI and runs the end-to-end SQL tests against real databases started as service containers: **Oracle Free 23ai** (`gvenzl/oracle-free:23-slim`: `test/e2e`, `test/e2e/spatial`, `test/e2e/23ai`) and **Oracle XE 21c** (`gvenzl/oracle-xe:21-slim`: `test/e2e`, `test/e2e/spatial`), with the newest Instant Client |
 | `zig-0.15.yml` | manual (`workflow_dispatch`) | `ubuntu-latest`, Zig 0.15.2 | the same steps as `ci.yml`, to keep the compat layer honest; uploads nothing |
 | `windows.yml` | manual | `windows-latest`, Zig 0.15.2 and 0.17 | builds `windows_amd64` natively, then `test-windows.ps1 -SkipOracle` (PowerShell 7 and Windows PowerShell 5.1): downloads the pinned official DuckDB CLI and verifies its checksum, `LOAD`s the extension under its exact shipped file name, `duckdb_extensions()` shows it loaded, `oracle_client_info()` runs |
 | `e2e-oracle19c.yml` | manual, **owner only** (`github.actor == 'jamescook'`) | self-hosted `[self-hosted, windows, oracle19c]` | the real-database end-to-end tests (`test/e2e`) against Oracle 19c, using the build from the latest successful `ci.yml` run on `main`. Setup: [SELF_HOSTED_RUNNER.md](SELF_HOSTED_RUNNER.md) |
@@ -165,7 +177,7 @@ the checksums there (compare them with the digests GitHub shows on the release p
 Checks that used to run in CI and now run only by hand: the Oracle Instant Client matrix (`verify_artifact.py --client DIR`), the
 silent-listener timeout test (`tools/timeout-test.sh`), the Windows client-library scenarios under Wine
 (`tools/windows-locator-test.sh`), the Windows ARM64 runner job, the loads into older DuckDB releases, and
-`tools/live_oracle_test.py` against an Oracle Free container.
+`tools/live_oracle_test.py` (an older, smaller live test that `test/e2e` and the `e2e-oracle` job now supersede).
 
 ## Project layout
 
@@ -190,8 +202,9 @@ test/sql/*.test              SQLLogicTests (no-client paths)
 tools/verify_artifact.py     the artifact rules in one place: name, footer, PE, stock-CLI load, negative control, client checks (+ tests)
 tools/windows-locator-test.sh Windows client-locator scenarios with the real Windows duckdb.exe + Instant Client (Wine or Windows)
 tools/                       package.py (zip packaging, owns the shipped name), pe_inspect.py (x64+ARM64), check_footer.py, timeout-test.sh, live_oracle_test.py,
-                             duckdb-cli-pins.json (pinned DuckDB CLI version + checksums), fetch-duckdb-cli.sh, test_ci_config.py (guards the workflow contract)
-test/e2e/                    end-to-end SQL tests run against a real Oracle database by test-windows.ps1 (test/e2e/23ai/ for 23ai/26ai)
+                             duckdb-cli-pins.json (pinned DuckDB CLI version + checksums), fetch-duckdb-cli.sh, install-instantclient-linux.sh, e2e_run.py (the Linux e2e runner),
+                             test_ci_config.py (guards the workflow contract), test_e2e_run.py
+test/e2e/                    end-to-end SQL tests run against a real Oracle database by test-windows.ps1 and tools/e2e_run.py (23ai/ for 23ai/26ai, spatial/ for SDO_GEOMETRY)
 test-windows.ps1             Windows test: pinned stock CLI, oci.dll check, LOAD, and the end-to-end tests (used by hand and by CI)
 third_party/                 vendored DuckDB headers, ODPI-C, metadata script (see third_party/VERSIONS.md)
 .github/workflows/           ci.yml, zig-0.15.yml, windows.yml, e2e-oracle19c.yml (see Continuous integration)

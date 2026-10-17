@@ -121,15 +121,16 @@ The workflow has no automatic triggers. The workflow file must be on the default
 * from a terminal: `gh workflow run e2e-oracle19c.yml --repo jamescook/duckdb-oracle --ref main`, then
   `gh run watch --repo jamescook/duckdb-oracle`.
 
-It tests the **latest successful `ci.yml` build on `main`**. If you have just pushed, wait for `ci.yml` to finish and pass first,
-or the job tells you there is no build to test. The tests and scripts come from the branch you dispatch, so for a normal run
-use `main`.
+It tests the **latest successful `ci.yml` build on `main`**: a push to `main`, or a manual run of `ci.yml` on `main`. While `ci.yml`
+is configured not to run on pushes to `main` (its `branches-ignore: [main]` filter), start it by hand first: **Actions > CI > Run
+workflow**, branch `main`, and let it pass. Otherwise the job tells you there is no build to test. The tests and scripts come from
+the branch you dispatch, so for a normal run use `main`.
 
-Only a build of a commit that is **on `main`**, from a **push to this repository**, can be chosen. That matters because the build is
+Only a build of a commit that is **on `main`**, from a **push or manual run in this repository**, can be chosen. That matters because the build is
 loaded into `duckdb.exe` on your machine while the database password is in its environment. A pull request from a fork whose branch
 happens to be called `main` has `ci.yml` runs and artifacts too, and a plain "branch is main" lookup would match them; the workflow
-therefore asks for push events only, re-checks the event and the repository of every run, and asks GitHub whether the built commit
-is an ancestor of `main`.
+therefore leaves pull-request runs out of the query, re-checks the event and the repository of every run, and asks GitHub whether
+the built commit is an ancestor of `main`.
 
 To run the same tests by hand on this machine (with a checkout, `$env:ORACLE_DSN` / `$env:ORACLE_USER` set, and the password
 entered without echo, see `Get-Help .\test-windows.ps1 -Full`):

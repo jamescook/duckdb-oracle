@@ -7,7 +7,7 @@ limitations. For a quick introduction see the [README](../README.md). Column typ
 
 ```sql
 oracle_query(dsn, sql [, user := ..., password_env := ..., auth := ..., unconstrained_number := ...,
-                         connect_timeout := ..., timeout := ...])
+                         geometry := ..., geometry_srid := ..., connect_timeout := ..., timeout := ...])
 ```
 
 Table function. It runs one Oracle query and returns its result set.
@@ -20,6 +20,8 @@ Table function. It runs one Oracle query and returns its result set.
 | `auth := VARCHAR` | Optional. `'password'` (default) or `'external'`: Oracle wallet (`/@alias`), Kerberos or OS authentication, where no user or password is given. `user` and `password_env` are refused in external mode |
 | `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
 | `unconstrained_number := VARCHAR` | Optional. How a `NUMBER` with no exact `DECIMAL` form is returned (see [TYPES.md](TYPES.md#unconstrained-number)): `'double'` (default, checked), `'lossy_double'` or `'varchar'` |
+| `geometry := VARCHAR` | Optional. What `MDSYS.SDO_GEOMETRY` columns become (see [TYPES.md](TYPES.md#spatial-data-sdo_geometry)): `'wkb'` (default, `BLOB`) or `'wkt'` (`VARCHAR`) |
+| `geometry_srid := BOOLEAN` | Optional, default `false`. `true` adds a `BIGINT` `<name>_srid` column after every geometry column (NULL for a NULL geometry or a geometry without SRID) |
 | `connect_timeout := BIGINT` | Optional. Seconds allowed for the connection handshake. Default **30**, `0` = no limit. Added to Easy Connect strings as `connect_timeout=N` unless the DSN already sets it; TNS aliases and `(DESCRIPTION=...)` strings are used unchanged (set it in `sqlnet.ora`/the descriptor) |
 | `timeout := BIGINT` | Optional. Seconds allowed for each Oracle round trip on the session (describe, execute, every fetch). Default **600**, `0` = no limit. A query that legitimately takes longer than this before returning its first row needs a larger value |
 

@@ -374,6 +374,14 @@ pub const Params = struct {
 pub const ColumnInfo = struct {
     name: []u8,
     type_info: c.dpiDataTypeInfo,
+    /// For an object-typed column (such as MDSYS.SDO_GEOMETRY): the type's schema and name, copied
+    /// because ODPI-C owns the originals only while the statement is open. Empty otherwise.
+    object_schema: []u8 = &.{},
+    object_name: []u8 = &.{},
+
+    pub fn isObject(self: ColumnInfo) bool {
+        return self.object_name.len > 0;
+    }
 };
 
 /// Result of describing a query without running it.
@@ -384,11 +392,17 @@ pub const Description = struct {
 
     pub fn deinit(self: *Description, a: std.mem.Allocator) void {
         a.free(self.sql);
-        for (self.columns) |col| a.free(col.name);
+        for (self.columns) |col| freeColumn(a, col);
         a.free(self.columns);
         self.* = .{ .sql = &.{}, .columns = &.{} };
     }
 };
+
+fn freeColumn(a: std.mem.Allocator, col: ColumnInfo) void {
+    a.free(col.name);
+    a.free(col.object_schema);
+    a.free(col.object_name);
+}
 
 pub const Session = struct {
     ctx: *c.dpiContext,
@@ -512,7 +526,7 @@ pub const Session = struct {
         const cols = try a.alloc(ColumnInfo, ncols);
         var filled: usize = 0;
         errdefer {
-            for (cols[0..filled]) |col| a.free(col.name);
+            for (cols[0..filled]) |col| freeColumn(a, col);
             a.free(cols);
         }
         while (filled < ncols) {
@@ -522,7 +536,20 @@ pub const Session = struct {
                 return error.Bind;
             }
             const name: []const u8 = if (qi.name) |n| n[0..qi.nameLength] else "";
-            cols[filled] = .{ .name = try a.dupe(u8, name), .type_info = qi.typeInfo };
+            var col: ColumnInfo = .{ .name = try a.dupe(u8, name), .type_info = qi.typeInfo };
+            errdefer freeColumn(a, col);
+            if (qi.typeInfo.oracleTypeNum == c.DPI_ORACLE_TYPE_OBJECT and qi.typeInfo.objectType != null) {
+                var oi = std.mem.zeroes(c.dpiObjectTypeInfo);
+                if (c.dpiObjectType_getInfo(qi.typeInfo.objectType, &oi) != c.DPI_SUCCESS) {
+                    oracle.setDpiError(msg, self.ctx, "describe object type");
+                    return error.Bind;
+                }
+                if (oi.schema != null and oi.name != null) {
+                    col.object_schema = try a.dupe(u8, oi.schema[0..oi.schemaLength]);
+                    col.object_name = try a.dupe(u8, oi.name[0..oi.nameLength]);
+                }
+            }
+            cols[filled] = col;
             filled += 1;
         }
         return .{ .sql = sql, .columns = cols };
