@@ -371,7 +371,6 @@ pub fn oracleTypeName(ot: c.dpiOracleTypeNum) []const u8 {
     };
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests (hand-built dpiDataTypeInfo / dpiData values; no DuckDB or OCI needed)
 // ---------------------------------------------------------------------------
@@ -665,7 +664,6 @@ test "varchar-mode number needs the full NUMBER text buffer in the batch budget"
     const plan = try planWith(c.DPI_ORACLE_TYPE_NUMBER, 0, -127, .varchar);
     try testing.expect(plan.bufferBytes() >= 172);
 }
-
 
 // --- write(): every kind through the vector-sink and handle-reader seams -------
 

@@ -257,7 +257,7 @@ test "credentials: a missing or empty password names the variable that was read"
 
 test "credentials: the error text never contains the password" {
     var msg: Msg = .{};
-    try testing.expectError(error.Bind, resolveWith(&.{ .{ "ORACLE_PASSWORD", "hunter2-SECRET" } }, .{}, &msg)); // no user
+    try testing.expectError(error.Bind, resolveWith(&.{.{ "ORACLE_PASSWORD", "hunter2-SECRET" }}, .{}, &msg)); // no user
     try testing.expect(std.mem.indexOf(u8, msg.slice(), "hunter2-SECRET") == null);
 }
 

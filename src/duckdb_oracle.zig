@@ -177,9 +177,6 @@ fn positionalParam(info: c.duckdb_bind_info, idx: u64) ?[]u8 {
     return valueToOwned(v);
 }
 
-
-
-
 fn setInvalid(vec: c.duckdb_vector, row: u64) void {
     duck("duckdb_vector_ensure_validity_writable")(vec);
     const validity = duck("duckdb_vector_get_validity")(vec);

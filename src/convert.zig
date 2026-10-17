@@ -672,7 +672,6 @@ test "parseNumberAsDouble: malformed text" {
     try testing.expectError(error.InvalidNumber, parseNumberAsDouble("12a"));
 }
 
-
 // --- review F14: malformed vectors must be errors, never garbage or a null read -
 
 test "convertVector rejects a null dimensions pointer instead of publishing garbage" {
