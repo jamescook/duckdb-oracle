@@ -73,19 +73,27 @@ class Resolved:
     path: str
 
 
-def _require_shipped_entry(z, src):
-    """The zip rule, in one place: exactly one entry, with the shipped name."""
+def _open_shipped_zip(src):
+    """Open the zip and enforce the zip rule, in one place: it exists, is a zip, and
+    contains exactly one entry with the shipped name."""
+    if not os.path.isfile(src):
+        raise ArtifactError(f"{src}: no such file")
+    try:
+        z = zipfile.ZipFile(src)
+    except zipfile.BadZipFile:
+        raise ArtifactError(f"{src} is not a zip archive") from None
     names = z.namelist()
     if names != [SHIPPED_NAME]:
+        z.close()
         raise ArtifactError(f"{src} must contain exactly [{SHIPPED_NAME}], found {names}")
+    return z
 
 
 @contextlib.contextmanager
 def resolve(src):
     """Yield the extension exactly as shipped (see module doc)."""
     if src.lower().endswith(".zip"):
-        with zipfile.ZipFile(src) as z:
-            _require_shipped_entry(z, src)
+        with _open_shipped_zip(src) as z:
             tmp = tempfile.mkdtemp(prefix="duckdb-oracle-pkg.")
             try:
                 z.extract(SHIPPED_NAME, tmp)
@@ -93,6 +101,8 @@ def resolve(src):
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
     else:
+        if not os.path.isfile(src):
+            raise ArtifactError(f"{src}: no such file")
         base = os.path.basename(src)
         if base != SHIPPED_NAME:
             raise ArtifactError(
@@ -108,8 +118,7 @@ def extract(src):
     if not src.lower().endswith(".zip"):
         with resolve(src) as r:
             return r.path
-    with zipfile.ZipFile(src) as z:
-        _require_shipped_entry(z, src)
+    with _open_shipped_zip(src) as z:
         tmp = tempfile.mkdtemp(prefix="duckdb-oracle-pkg.")
         z.extract(SHIPPED_NAME, tmp)
         return os.path.join(tmp, SHIPPED_NAME)

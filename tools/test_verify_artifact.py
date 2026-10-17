@@ -126,6 +126,27 @@ class ResolveTests(Tmp):
         self.assertIs(va.SHIPPED_NAME, package.SHIPPED_NAME)
 
 
+class MissingArtifactTests(Tmp):
+    def test_a_missing_artifact_is_a_failed_check_not_a_traceback(self):
+        for missing in (self.path("nope.zip"), self.path(package.SHIPPED_NAME)):
+            r = subprocess.run([sys.executable, os.path.join(HERE, "verify_artifact.py"), "check", missing, "--platform", "linux_amd64"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("FAIL", r.stdout)
+
+    def test_extract_of_a_missing_artifact_fails_cleanly(self):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "verify_artifact.py"), "extract", self.path("nope.zip")], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_file_that_is_not_a_zip_fails_cleanly(self):
+        bad = self.path("bad.zip")
+        open(bad, "wb").write(b"this is not a zip")
+        with self.assertRaises(va.ArtifactError):
+            va.resolve(bad).__enter__()
+
+
 class FooterTests(Tmp):
     def build(self, platform, version):
         lib = self.path("lib.bin")
