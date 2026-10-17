@@ -3,6 +3,7 @@ test {
     _ = @import("convert.zig");
     _ = @import("arch.zig");
     _ = @import("timeouts.zig");
+    _ = @import("cursor.zig");
     _ = @import("compat.zig");
     _ = @import("compat_env_test.zig");
 }

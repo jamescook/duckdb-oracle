@@ -10,6 +10,10 @@ const convert = @import("convert.zig");
 const oracle = @import("oracle.zig");
 const arch = @import("arch.zig");
 const timeouts = @import("timeouts.zig");
+const cursor_mod = @import("cursor.zig");
+const OdpiBackend = @import("odpi_backend.zig").OdpiBackend;
+
+const OdpiCursor = cursor_mod.Cursor(OdpiBackend);
 const build_options = @import("build_options");
 
 const alloc = std.heap.c_allocator;
@@ -406,32 +410,14 @@ fn planLogicalType(plan: *const convert.ColumnPlan) c.duckdb_logical_type {
 }
 
 const QueryScan = struct {
-    stmt: ?*c.dpiStmt = null,
-    vars: []?*c.dpiVar,
-    data: []?[*]c.dpiData,
-    done: bool = false,
+    cursor: *OdpiCursor,
     /// scratch buffer for JSON serialisation (reused across rows)
     json_buf: std.ArrayList(u8) = .empty,
 
     fn destroy(self: *QueryScan) void {
-        self.release();
+        self.cursor.destroy();
         self.json_buf.deinit(alloc);
-        alloc.free(self.vars);
-        alloc.free(self.data);
         alloc.destroy(self);
-    }
-
-    /// Free all ODPI-C handles (also used as soon as the result is exhausted).
-    fn release(self: *QueryScan) void {
-        for (self.vars) |*v| {
-            if (v.*) |handle| _ = c.dpiVar_release(handle);
-            v.* = null;
-        }
-        if (self.stmt) |s| {
-            _ = c.dpiStmt_close(s, null, 0);
-            _ = c.dpiStmt_release(s);
-            self.stmt = null;
-        }
     }
 };
 
@@ -451,59 +437,20 @@ fn queryInitImpl(info: c.duckdb_init_info, msg: *Msg) !void {
         msg.set("duckdb_oracle: missing bind data", .{});
         return error.Init;
     }));
-    const ctx = bind.ctx;
-    const ncols: u32 = @intCast(bind.plans.len);
+
+    const backend: OdpiBackend = .{ .ctx = bind.ctx, .conn = bind.conn orelse {
+        msg.set("duckdb_oracle: missing connection", .{});
+        return error.Init;
+    } };
+    const cursor = OdpiCursor.open(alloc, backend, bind.sql, bind.plans, bind.fetch_rows, msg) catch return error.Init;
+    errdefer cursor.destroy();
 
     const scan = alloc.create(QueryScan) catch {
         msg.set("duckdb_oracle: out of memory", .{});
         return error.Init;
     };
-    scan.* = .{ .vars = &.{}, .data = &.{} };
-    var scan_owned = true;
-    defer if (scan_owned) scan.destroy();
-    scan.vars = alloc.alloc(?*c.dpiVar, ncols) catch {
-        msg.set("duckdb_oracle: out of memory", .{});
-        return error.Init;
-    };
-    @memset(scan.vars, null);
-    scan.data = alloc.alloc(?[*]c.dpiData, ncols) catch {
-        msg.set("duckdb_oracle: out of memory", .{});
-        return error.Init;
-    };
-    @memset(scan.data, null);
+    scan.* = .{ .cursor = cursor };
 
-    if (c.dpiConn_prepareStmt(bind.conn, 0, bind.sql.ptr, len32(bind.sql), null, 0, &scan.stmt) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "prepare failed");
-        return error.Init;
-    }
-    if (c.dpiStmt_setFetchArraySize(scan.stmt, bind.fetch_rows) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "set fetch array size");
-        return error.Init;
-    }
-    var exec_cols: u32 = 0;
-    if (c.dpiStmt_execute(scan.stmt, c.DPI_MODE_EXEC_DEFAULT, &exec_cols) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "execute failed");
-        return error.Init;
-    }
-    if (exec_cols != ncols) {
-        msg.set("duckdb_oracle: query shape changed between bind and execution ({d} vs {d} columns)", .{ ncols, exec_cols });
-        return error.Init;
-    }
-
-    for (bind.plans, 0..) |*plan, i| {
-        var data: [*c]c.dpiData = null;
-        if (c.dpiConn_newVar(bind.conn, plan.oracle_type, plan.native_type, bind.fetch_rows, plan.size, @intFromBool(plan.size_is_bytes), 0, null, &scan.vars[i], &data) != c.DPI_SUCCESS) {
-            oracle.setDpiError(msg, ctx, "create fetch variable");
-            return error.Init;
-        }
-        scan.data[i] = data;
-        if (c.dpiStmt_define(scan.stmt, @intCast(i + 1), scan.vars[i]) != c.DPI_SUCCESS) {
-            oracle.setDpiError(msg, ctx, "define column");
-            return error.Init;
-        }
-    }
-
-    scan_owned = false;
     duck("duckdb_init_set_init_data")(info, scan, destroyQueryScan);
     duck("duckdb_init_set_max_threads")(info, 1);
 }
@@ -519,25 +466,20 @@ fn queryFunction(info: c.duckdb_function_info, output: c.duckdb_data_chunk) call
 fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, msg: *Msg) !void {
     const bind: *QueryBind = @ptrCast(@alignCast(duck("duckdb_function_get_bind_data")(info) orelse return error.Missing));
     const scan: *QueryScan = @ptrCast(@alignCast(duck("duckdb_function_get_init_data")(info) orelse return error.Missing));
-    if (scan.done or scan.stmt == null) {
+    const batch = scan.cursor.nextBatch(msg) catch return error.Fetch;
+    const nrows = batch.nrows;
+    const buffer_row = batch.buffer_row;
+    if (nrows == 0) {
+        // exhausted, failed earlier or closed: an empty chunk ends the scan
         duck("duckdb_data_chunk_set_size")(output, 0);
+        scan.cursor.endBatch();
         return;
-    }
-
-    var buffer_row: u32 = 0;
-    var nrows: u32 = 0;
-    var more: c_int = 0;
-    if (c.dpiStmt_fetchRows(scan.stmt, bind.fetch_rows, &buffer_row, &nrows, &more) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, bind.ctx, "fetch failed");
-        scan.release();
-        scan.done = true;
-        return error.Fetch;
     }
 
     for (bind.plans, 0..) |*plan, col| {
         const vec = duck("duckdb_data_chunk_get_vector")(output, col);
         const out: [*]u8 = @ptrCast(duck("duckdb_vector_get_data")(vec) orelse return error.Missing);
-        const data = scan.data[col] orelse return error.Missing;
+        const data = scan.cursor.column(col) orelse return error.Missing;
         // LIST (VECTOR) state
         const child: c.duckdb_vector = if (plan.kind == .list) duck("duckdb_list_vector_get_child")(vec) else null;
         var list_size: u64 = if (plan.kind == .list) duck("duckdb_list_vector_get_size")(vec) else 0;
@@ -616,11 +558,9 @@ fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, 
     }
     duck("duckdb_data_chunk_set_size")(output, nrows);
 
-    if (more == 0) {
-        // Result exhausted: give the cursor back to Oracle right away.
-        scan.release();
-        scan.done = true;
-    }
+    // The values were copied into DuckDB vectors; if the result is exhausted the
+    // cursor gives its handles back to Oracle right away.
+    scan.cursor.endBatch();
 }
 
 // ---------------------------------------------------------------------------
