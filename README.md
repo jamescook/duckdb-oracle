@@ -92,6 +92,13 @@ Good to know: Oracle column names come back in upper case; DuckDB doesn't mind. 
 as `DOUBLE` unless you `CAST` them as above. `oracle_client_info()` is the first thing to run when something is wrong: it reports whether
 Instant Client was found, which version and from where, and a plain-language message if not.
 
+More than `oracle_query`:
+
+* `oracle_scan(dsn, 'schema.table')` reads a whole table, view or synonym by name, resolved the way Oracle does (current schema, then
+  public synonyms; `'"MixedCase"'` works), and `oracle_tables(dsn, schema := 'HR')` lists them. `current_schema := 'HR'` works on every function.
+* Spatial: `SDO_GEOMETRY` columns arrive as WKB in a `BLOB` (read it with `ST_GeomFromWKB`), or as text with `geometry := 'wkt'`.
+* Oracle 23ai `VECTOR` columns arrive as `FLOAT[]` / `DOUBLE[]` lists (plus `BOOLEAN` and `JSON`); these need Instant Client 23ai.
+
 Options (a different user, a wallet instead of a password, timeouts, ...) are `oracle_query(..., user := 'SCOTT', timeout := 3600)`.
 All of them, and the result columns of `oracle_client_info()`, are in the [reference](docs/REFERENCE.md). Type conversions are in
 [docs/TYPES.md](docs/TYPES.md).
@@ -122,7 +129,7 @@ More messages: [docs/REFERENCE.md](docs/REFERENCE.md#errors).
 * **Unsigned**, so it can't be installed with `INSTALL ... FROM community`; you must start DuckDB with `-unsigned`.
 * **Needs the 64-bit Oracle Instant Client** to match your DuckDB. Oracle has no Windows ARM64 client; see [compatibility](docs/COMPATIBILITY.md).
 * **One Oracle session per query, read by one thread.** Ctrl+C can't cancel a running Oracle call; connect and call timeouts (30 s / 600 s by default) end hangs.
-* **Early software.** Oracle 19c is the main target, but the tests against a live Oracle server run only on demand, on the maintainer's own 19c database. Please report problems.
+* **Early software.** Oracle 19c is the main target, but the automatic CI tests against Oracle Free 23ai and XE 21c containers, and 19c only on demand on the maintainer's own database. The spatial, VECTOR and schema features were written before they had a run against a live server. Please report problems.
 
 The full list is in [docs/REFERENCE.md](docs/REFERENCE.md#known-limitations); plans are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
