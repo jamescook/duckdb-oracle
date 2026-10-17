@@ -220,7 +220,7 @@ architecture of the first `oci.dll` on the search path when that doesn't match t
 
 ## SQL surface (v1)
 
-### `oracle_query(dsn, sql, user := ..., password := ...)`
+### `oracle_query(dsn, sql, user := ..., password_env := ...)`
 
 Table function. It runs one Oracle query and returns its result set.
 
@@ -229,7 +229,12 @@ Table function. It runs one Oracle query and returns its result set.
 | `dsn VARCHAR` | Easy Connect string such as `localhost:1521/ORCLPDB1`, or a TNS alias (`TNS_ADMIN`) |
 | `sql VARCHAR` | An Oracle `SELECT` / `WITH` query, using Oracle SQL dialect |
 | `user := VARCHAR` | Optional. Defaults to `$ORACLE_USER` |
-| `password := VARCHAR` | Optional. Defaults to `$ORACLE_PASSWORD`, the recommended way to supply it |
+| `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
+
+**There is no `password` argument, on purpose.** DuckDB echoes the failing SQL text, literals included, in error
+messages (for example a wrong password, ORA-01017) and the CLI keeps a history, so a password written in SQL leaks.
+The password is read from the environment only. `password := '...'` from earlier versions is now rejected with
+`Invalid named parameter "password"`; set `ORACLE_PASSWORD` (or the variable named by `password_env`) instead.
 
 ```sql
 SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT owner, table_name FROM all_tables');

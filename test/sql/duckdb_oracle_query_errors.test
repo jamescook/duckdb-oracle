@@ -1,30 +1,47 @@
 # name: test/sql/duckdb_oracle_query_errors.test
 # description: oracle_query argument validation and error reporting (no server needed)
 # group: [duckdb_oracle]
+#
+# The harness (zig build sqllogictest) exports ORACLE_USER=u and
+# ORACLE_PASSWORD=slt-secret-pw-7f3a, so these statements reach the connect step
+# without any inline credentials.
 
 require duckdb_oracle
 
 statement error
-SELECT * FROM oracle_query(NULL, 'select 1 from dual', user := 'u', password := 'p');
+SELECT * FROM oracle_query(NULL, 'select 1 from dual');
 ----
 dsn must not be NULL
 
 statement error
-SELECT * FROM oracle_query('127.0.0.1:1/NOPE', NULL, user := 'u', password := 'p');
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', NULL);
 ----
 sql must not be NULL
 
 statement error
-SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := '', password := 'p');
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := '');
 ----
 no user given
 
+# Passwords are never accepted as SQL arguments: DuckDB echoes the failing SQL
+# text (including literals) in error messages and the CLI keeps a history.
 statement error
-SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := 'u', password := '');
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', password := 'p');
 ----
-no password given
+Invalid named parameter "password"
 
-# Wrong argument types / unknown named parameters are rejected by DuckDB's binder
+# The password comes from an environment variable; password_env names it.
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', password_env := 'DUCKDB_ORACLE_TEST_SURELY_UNSET');
+----
+DUCKDB_ORACLE_TEST_SURELY_UNSET
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', password_env := NULL);
+----
+password_env must not be NULL
+
+# Unknown named parameters are rejected by DuckDB's binder
 statement error
 SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', schema := 'x');
 ----
@@ -34,9 +51,15 @@ SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', schema := '
 # with Instant Client it is an ORA-125xx connect error. Either way a clean
 # DuckDB error containing the code, never a crash.
 statement error
-SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := 'u', password := 'p');
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual');
 ----
 <REGEX>:.*duckdb_oracle: .*(DPI-1047|ORA-125[0-9][0-9]).*
+
+# A failing connect must never echo the secret that was read from the environment.
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual');
+----
+<!REGEX>:.*slt-secret-pw-7f3a.*
 
 # the process (and the extension) are still healthy afterwards
 query I

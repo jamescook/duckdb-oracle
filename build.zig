@@ -209,6 +209,9 @@ pub fn build(b: *Build) void {
             slt.addDirectoryArg(b.path("test/sql"));
             slt.addArg("--external-extension");
             slt.addFileArg(ext_path);
+            // Credentials come from the environment only (never SQL arguments).
+            slt.setEnvironmentVariable("ORACLE_USER", "u");
+            slt.setEnvironmentVariable("ORACLE_PASSWORD", "slt-secret-pw-7f3a");
             slt.has_side_effects = true;
             slt_step.dependOn(&slt.step);
         }

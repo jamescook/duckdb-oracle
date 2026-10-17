@@ -24,7 +24,7 @@ for IC in "$@"; do
   "$DUCKDB" -unsigned -line -c "LOAD '$EXT'; SELECT client_library_found, client_version, client_library_path, odpi_version, message FROM oracle_client_info();"
   echo "exit=$?"
   echo "## check 3: unreachable DSN must raise a DuckDB error with ORA-/DPI-"
-  out=$("$DUCKDB" -unsigned -c "LOAD '$EXT'; SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'SELECT * FROM dual', user := 'scott', password := 'x');" 2>&1)
+  out=$(ORACLE_USER=scott ORACLE_PASSWORD=x "$DUCKDB" -unsigned -c "LOAD '$EXT'; SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'SELECT * FROM dual');" 2>&1)
   c3=$?; echo "$out" | grep -v '^LINE\|^ *\^\|^$'; echo "exit=$c3"
   if [ $c3 -ne 1 ] || ! echo "$out" | grep -Eq '(ORA|DPI)-[0-9]+'; then echo "UNEXPECTED"; rc=1; fi
 done

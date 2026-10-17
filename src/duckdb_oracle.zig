@@ -1,7 +1,7 @@
 //! duckdb-oracle: query Oracle from DuckDB through the stable C Extension API + ODPI-C.
 //!
 //! SQL surface (v1):
-//!   oracle_query(dsn VARCHAR, sql VARCHAR, user := VARCHAR, password := VARCHAR)
+//!   oracle_query(dsn VARCHAR, sql VARCHAR, user := VARCHAR, password_env := VARCHAR)
 //!   oracle_client_info()
 const std = @import("std");
 const compat = @import("compat.zig");
@@ -87,7 +87,11 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     duck("duckdb_table_function_add_parameter")(tf, vt); // dsn
     duck("duckdb_table_function_add_parameter")(tf, vt); // sql
     duck("duckdb_table_function_add_named_parameter")(tf, "user", vt);
-    duck("duckdb_table_function_add_named_parameter")(tf, "password", vt);
+    // No `password` parameter on purpose: DuckDB echoes the failing SQL text
+    // (literals included) in error messages and the CLI keeps a history, so a
+    // password given in SQL leaks. The password is read from an environment
+    // variable; `password_env` only chooses which one.
+    duck("duckdb_table_function_add_named_parameter")(tf, "password_env", vt);
 
     duck("duckdb_table_function_set_bind")(tf, queryBind);
     duck("duckdb_table_function_set_init")(tf, queryInit);
@@ -122,6 +126,14 @@ fn namedParam(info: c.duckdb_bind_info, name: [*:0]const u8) ?[]u8 {
     if (v == null) return null;
     defer duck("duckdb_destroy_value")(&v);
     return valueToOwned(v);
+}
+
+/// True when the named parameter was supplied in the SQL (even as NULL).
+fn hasNamedParam(info: c.duckdb_bind_info, name: [*:0]const u8) bool {
+    var v = duck("duckdb_bind_get_named_parameter")(info, name);
+    if (v == null) return false;
+    duck("duckdb_destroy_value")(&v);
+    return true;
 }
 
 fn positionalParam(info: c.duckdb_bind_info, idx: u64) ?[]u8 {
@@ -206,7 +218,21 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
 
     const user = namedParam(info, "user") orelse envOwned("ORACLE_USER");
     defer if (user) |u| alloc.free(u);
-    const password = namedParam(info, "password") orelse envOwned("ORACLE_PASSWORD");
+
+    // Name of the environment variable that holds the password.
+    var pw_var_owned: ?[:0]u8 = null;
+    defer if (pw_var_owned) |v| alloc.free(v);
+    var pw_var: [:0]const u8 = "ORACLE_PASSWORD";
+    if (hasNamedParam(info, "password_env")) {
+        const given = namedParam(info, "password_env") orelse {
+            msg.set("duckdb_oracle: oracle_query: password_env must not be NULL", .{});
+            return error.Bind;
+        };
+        defer alloc.free(given);
+        pw_var_owned = try compat.dupeZ(alloc, given);
+        pw_var = pw_var_owned.?;
+    }
+    const password = envOwned(pw_var);
     defer freeSecret(password);
 
     if (user == null or user.?.len == 0) {
@@ -214,7 +240,7 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
         return error.Bind;
     }
     if (password == null or password.?.len == 0) {
-        msg.set("duckdb_oracle: oracle_query: no password given; set the ORACLE_PASSWORD environment variable (or pass password := '...')", .{});
+        msg.set("duckdb_oracle: oracle_query: no password given: the environment variable {s} is empty or not set (passwords are never accepted as SQL arguments; password_env := 'NAME' selects another variable)", .{pw_var});
         return error.Bind;
     }
 
