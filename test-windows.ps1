@@ -44,7 +44,7 @@ param(
     [string]$Extension = '',
     [string]$DuckDB = '',
     [string]$Dsn = 'localhost:1521/ORCLPDB1',
-    [string]$User = 'AIMS_DEV',
+    [string]$User = 'SAMPLE_DEV',
     [switch]$SkipOracle,
     [int]$TimeoutSeconds = 120,
     # Official DuckDB release to download/expect (any 1.x >= the footer's C API

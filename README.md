@@ -203,7 +203,7 @@ architecture of the first `oci.dll` on the search path when that doesn't match t
 5. **Set credentials in the environment**, not in SQL. DuckDB echoes the failing SQL line in
    error messages, and the CLI keeps a history:
    ```powershell
-   $env:ORACLE_USER = 'AIMS_DEV'
+   $env:ORACLE_USER = 'SAMPLE_DEV'
    $s = Read-Host 'Oracle password' -AsSecureString
    $env:ORACLE_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
@@ -233,7 +233,7 @@ Table function. It runs one Oracle query and returns its result set.
 
 ```sql
 SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT owner, table_name FROM all_tables');
-SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM dual', user := 'AIMS_DEV');
+SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM dual', user := 'SAMPLE_DEV');
 CREATE TABLE t AS SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM aims.orders');
 ```
 
