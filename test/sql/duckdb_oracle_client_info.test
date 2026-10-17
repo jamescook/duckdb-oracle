@@ -1,0 +1,39 @@
+# name: test/sql/duckdb_oracle_client_info.test
+# description: oracle_client_info() never fails, with or without Instant Client.
+#              Without a client it must report DPI-1047 cleanly.
+# group: [duckdb_oracle]
+
+require duckdb_oracle
+
+query I
+SELECT count(*) FROM oracle_client_info();
+----
+1
+
+query T
+SELECT odpi_version FROM oracle_client_info();
+----
+26.0.0
+
+# the C API version the binary was built for (-Dduckdb-version, default v1.2.0)
+query I
+SELECT duckdb_capi_version SIMILAR TO 'v1\.[0-9]+\.[0-9]+' FROM oracle_client_info();
+----
+true
+
+# no client: found=false, version NULL, message carries DPI-1047
+# client:    found=true, version like 19.26.0.0.0, message OK
+query I
+SELECT CASE WHEN client_library_found
+            THEN client_version SIMILAR TO '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' AND message = 'OK'
+            ELSE client_version IS NULL AND client_library_path IS NULL AND message LIKE 'DPI-1047:%'
+       END
+FROM oracle_client_info();
+----
+true
+
+# calling it repeatedly is fine (lazy init is retried / cached)
+query I
+SELECT count(*) FROM (SELECT * FROM oracle_client_info() UNION ALL SELECT * FROM oracle_client_info());
+----
+2

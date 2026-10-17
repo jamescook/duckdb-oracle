@@ -1,0 +1,10 @@
+.{
+    .name = .duckdb_oracle,
+    .version = "0.1.0",
+    .fingerprint = 0x9c11bb634dbc08c4,
+    .minimum_zig_version = "0.15.2",
+    // Everything is vendored under third_party/ (pinned, see third_party/VERSIONS.md),
+    // so the build needs no network access.
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build_compat.zig", "build.zig.zon", "mise.toml", "src", "third_party", "test", "tools", "README.md" },
+}

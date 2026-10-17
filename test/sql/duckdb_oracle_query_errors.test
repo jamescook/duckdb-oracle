@@ -1,0 +1,45 @@
+# name: test/sql/duckdb_oracle_query_errors.test
+# description: oracle_query argument validation and error reporting (no server needed)
+# group: [duckdb_oracle]
+
+require duckdb_oracle
+
+statement error
+SELECT * FROM oracle_query(NULL, 'select 1 from dual', user := 'u', password := 'p');
+----
+dsn must not be NULL
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', NULL, user := 'u', password := 'p');
+----
+sql must not be NULL
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := '', password := 'p');
+----
+no user given
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := 'u', password := '');
+----
+no password given
+
+# Wrong argument types / unknown named parameters are rejected by DuckDB's binder
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', schema := 'x');
+----
+<REGEX>:.*(Invalid named parameter|schema).*
+
+# Unreachable DSN: without Instant Client this is DPI-1047 (client missing),
+# with Instant Client it is an ORA-125xx connect error. Either way a clean
+# DuckDB error containing the code, never a crash.
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', user := 'u', password := 'p');
+----
+<REGEX>:.*duckdb_oracle: .*(DPI-1047|ORA-125[0-9][0-9]).*
+
+# the process (and the extension) are still healthy afterwards
+query I
+SELECT count(*) FROM oracle_client_info();
+----
+1

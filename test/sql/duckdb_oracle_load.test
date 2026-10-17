@@ -1,0 +1,22 @@
+# name: test/sql/duckdb_oracle_load.test
+# description: duckdb-oracle loads into a stock DuckDB and registers its functions
+# group: [duckdb_oracle]
+
+# Not built in: the functions must not exist before the extension is loaded.
+statement error
+SELECT * FROM oracle_client_info();
+----
+Catalog Error
+
+require duckdb_oracle
+
+query I
+SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'duckdb_oracle';
+----
+true
+
+query T
+SELECT function_name FROM duckdb_functions() WHERE function_name LIKE 'oracle_%' ORDER BY ALL;
+----
+oracle_client_info
+oracle_query
