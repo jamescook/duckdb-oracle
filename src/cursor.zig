@@ -180,8 +180,8 @@ const Fake = struct {
         live_vars: i32 = 0,
         bad_release: bool = false, // released or closed something twice / unknown
         rows_served: u32 = 0,
-        arrays: [8]?[]c.dpiData = .{null} ** 8,
-        var_live: [8]bool = .{false} ** 8,
+        arrays: [8]?[]c.dpiData = @splat(null),
+        var_live: [8]bool = @splat(false),
         next_var: u32 = 0,
         last_error_what: []const u8 = "",
     };

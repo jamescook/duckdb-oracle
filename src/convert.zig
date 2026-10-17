@@ -658,8 +658,10 @@ test "parseNumberAsDouble: fractions and huge magnitudes are accepted" {
     // 1/3 as Oracle prints it (40 digits): approximate by nature, must not be rejected
     try testing.expectEqual(@as(f64, 0.3333333333333333), try parseNumberAsDouble("0.3333333333333333333333333333333333333333"));
     // 1 followed by 100 zeros: more than 38 digits is a floating-point magnitude
-    const big = "1" ++ "0" ** 100;
-    try testing.expectEqual(@as(f64, 1e100), try parseNumberAsDouble(big));
+    // `**` (array repeat) does not parse in Zig 0.17; @splat works on every supported version
+    var big: [101]u8 = @splat('0');
+    big[0] = '1';
+    try testing.expectEqual(@as(f64, 1e100), try parseNumberAsDouble(&big));
     // an integral value written with a fractional zero part is still integral
     try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("9007199254740993.0"));
 }
@@ -675,7 +677,7 @@ test "parseNumberAsDouble: malformed text" {
 // --- review F14: malformed vectors must be errors, never garbage or a null read -
 
 test "convertVector rejects a null dimensions pointer instead of publishing garbage" {
-    var out: [8]u8 = .{0xAA} ** 8;
+    var out: [8]u8 = @splat(0xAA);
     // BINARY: 16 bits = 2 bytes, but no data pointer
     var vi = vecInfo(c.DPI_VECTOR_FORMAT_BINARY, 16, 1, null);
     try testing.expectError(error.NullDimensions, convertVector(&vi, .utinyint, &out));
@@ -696,7 +698,7 @@ test "convertVector rejects a null dimensions pointer instead of publishing garb
 }
 
 test "an all-zero sparse vector (no stored values, null pointers) is valid and densifies to zeros" {
-    var out: [4 * 8]u8 align(8) = .{0xAA} ** 32;
+    var out: [4 * 8]u8 align(8) = @splat(0xAA);
     var vi = vecInfo(c.DPI_VECTOR_FORMAT_FLOAT64, 4, 8, null);
     vi.isSparse = 1;
     vi.numSparseValues = 0;

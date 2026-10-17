@@ -30,7 +30,12 @@ fn isEasyConnect(dsn: []const u8) bool {
 }
 
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(hay, needle) != null;
+    if (needle.len > hay.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 pub fn callTimeoutMs(secs: u32) u32 {

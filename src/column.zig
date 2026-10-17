@@ -209,8 +209,10 @@ pub const NumberMode = enum {
     varchar,
 
     pub fn parse(text: []const u8) ?NumberMode {
-        inline for (@typeInfo(NumberMode).@"enum".fields) |f| {
-            if (std.ascii.eqlIgnoreCase(text, f.name)) return @field(NumberMode, f.name);
+        // an explicit table: @typeInfo's enum layout differs between Zig 0.15 and 0.17
+        const names = [_]struct { []const u8, NumberMode }{ .{ "double", .double }, .{ "lossy_double", .lossy_double }, .{ "varchar", .varchar } };
+        for (names) |n| {
+            if (std.ascii.eqlIgnoreCase(text, n[0])) return n[1];
         }
         return null;
     }
@@ -669,8 +671,8 @@ test "varchar-mode number needs the full NUMBER text buffer in the batch budget"
 
 const MemSink = struct {
     buf: [16 * 8]u8 align(16) = undefined,
-    valid: [8]bool = .{true} ** 8,
-    strs: [8]?[]u8 = .{null} ** 8,
+    valid: [8]bool = @splat(true),
+    strs: [8]?[]u8 = @splat(null),
     list_len: u64 = 0,
     child: [64]u8 align(16) = undefined,
     child_cap: u64 = 16, // elements

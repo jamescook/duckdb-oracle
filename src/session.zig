@@ -30,8 +30,10 @@ pub const Auth = enum {
     external,
 
     pub fn parse(text: []const u8) ?Auth {
-        inline for (@typeInfo(Auth).@"enum".fields) |f| {
-            if (std.ascii.eqlIgnoreCase(text, f.name)) return @field(Auth, f.name);
+        // an explicit table: @typeInfo's enum layout differs between Zig 0.15 and 0.17
+        const names = [_]struct { []const u8, Auth }{ .{ "password", .password }, .{ "external", .external } };
+        for (names) |n| {
+            if (std.ascii.eqlIgnoreCase(text, n[0])) return n[1];
         }
         return null;
     }
