@@ -2,6 +2,7 @@
 //! (The in-memory backend used by the tests lives in cursor.zig.)
 const std = @import("std");
 const c = @import("c.zig").c;
+const column = @import("column.zig");
 const convert = @import("convert.zig");
 const oracle = @import("oracle.zig");
 
@@ -39,7 +40,7 @@ pub const OdpiBackend = struct {
         return cols;
     }
 
-    pub fn newVar(self: OdpiBackend, plan: *const convert.ColumnPlan, rows: u32) Error!struct { handle: Var, data: [*]c.dpiData } {
+    pub fn newVar(self: OdpiBackend, plan: *const column.Column, rows: u32) Error!struct { handle: Var, data: [*]c.dpiData } {
         var v: ?*c.dpiVar = null;
         var data: [*c]c.dpiData = null;
         try ok(c.dpiConn_newVar(self.conn, plan.oracle_type, plan.native_type, rows, plan.size, @intFromBool(plan.size_is_bytes), 0, null, &v, &data));
@@ -78,5 +79,31 @@ pub const OdpiBackend = struct {
 
     pub fn describeError(self: OdpiBackend, msg: *oracle.Msg, comptime what: []const u8) void {
         oracle.setDpiError(msg, self.ctx, what);
+    }
+};
+
+/// Production handle reader for column.zig: values ODPI-C hands out as handles.
+pub const OdpiReader = struct {
+    pub const Error = error{Failed};
+
+    pub fn readVector(self: OdpiReader, handle: ?*c.dpiVector, info: *c.dpiVectorInfo) Error!void {
+        _ = self;
+        if (c.dpiVector_getValue(handle, info) != c.DPI_SUCCESS) return error.Failed;
+    }
+
+    pub fn readJson(self: OdpiReader, handle: ?*c.dpiJson) Error!*const c.dpiJsonNode {
+        _ = self;
+        var top: [*c]c.dpiJsonNode = null;
+        if (c.dpiJson_getValue(handle, convert.json_get_options, &top) != c.DPI_SUCCESS or top == null) return error.Failed;
+        return @ptrCast(top);
+    }
+
+    /// Valid until the rowid handle is released (the caller copies it at once).
+    pub fn readRowid(self: OdpiReader, handle: ?*c.dpiRowid) Error![]const u8 {
+        _ = self;
+        var p: [*c]const u8 = null;
+        var l: u32 = 0;
+        if (c.dpiRowid_getStringValue(handle, &p, &l) != c.DPI_SUCCESS) return error.Failed;
+        return if (p == null) "" else p[0..l];
     }
 };

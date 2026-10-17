@@ -366,9 +366,10 @@ mise.toml                    default Zig toolchain (0.15.2)
 src/duckdb_oracle.zig              entrypoint (duckdb_oracle_init_c_api), table functions, DuckDB vectors
 src/oracle.zig               lazy ODPI-C context, error formatting, client info
 src/cursor.zig               result-set lifetime: statement, fetch variables, early close; generic over a backend (+ tests with an in-memory backend)
-src/odpi_backend.zig         the ODPI-C backend for cursor.zig
+src/odpi_backend.zig         the ODPI-C adapters: backend for cursor.zig, handle reader for column.zig
 src/timeouts.zig             connect/call timeout policy (+ unit tests)
-src/convert.zig              Oracle -> DuckDB type planning + value conversion (+ unit tests)
+src/column.zig               what an Oracle column becomes in DuckDB: type plan, fetch cost, value write behind a vector-sink seam (+ tests)
+src/convert.zig              pure value primitives: timestamps, decimals, NUMBER-as-double check, JSON text, VECTOR copy (+ unit tests)
 src/c.zig                    C headers module (src/c_headers.h via b.addTranslateC)
 src/platform.c               loaded OCI library path, host architecture, first oci.dll + its PE machine
 src/arch.zig                 process/host architecture + Windows-on-ARM hints (+ unit tests)

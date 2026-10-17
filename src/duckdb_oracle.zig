@@ -6,12 +6,13 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const c = @import("c.zig").c;
-const convert = @import("convert.zig");
+const column = @import("column.zig");
 const oracle = @import("oracle.zig");
 const arch = @import("arch.zig");
 const timeouts = @import("timeouts.zig");
 const cursor_mod = @import("cursor.zig");
 const OdpiBackend = @import("odpi_backend.zig").OdpiBackend;
+const OdpiReader = @import("odpi_backend.zig").OdpiReader;
 
 const OdpiCursor = cursor_mod.Cursor(OdpiBackend);
 const build_options = @import("build_options");
@@ -97,7 +98,7 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     // password given in SQL leaks. The password is read from an environment
     // variable; `password_env` only chooses which one.
     duck("duckdb_table_function_add_named_parameter")(tf, "password_env", vt);
-    // 'double' (default, checked) | 'lossy_double' | 'varchar': see convert.NumberMode
+    // 'double' (default, checked) | 'lossy_double' | 'varchar': see column.NumberMode
     duck("duckdb_table_function_add_named_parameter")(tf, "unconstrained_number", vt);
 
     // Seconds; 0 disables. See timeouts.zig for why these exist.
@@ -209,7 +210,7 @@ const QueryBind = struct {
     ctx: *c.dpiContext,
     conn: ?*c.dpiConn = null,
     sql: []u8 = &.{},
-    plans: []convert.ColumnPlan = &.{},
+    plans: []column.Column = &.{},
     /// Oracle column names, for error messages
     names: [][]u8 = &.{},
     vector_size: u32,
@@ -278,14 +279,14 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
         return error.Bind;
     }
 
-    var number_mode: convert.NumberMode = .double;
+    var number_mode: column.NumberMode = .double;
     if (hasNamedParam(info, "unconstrained_number")) {
         const given = namedParam(info, "unconstrained_number") orelse {
             msg.set("duckdb_oracle: oracle_query: unconstrained_number must not be NULL", .{});
             return error.Bind;
         };
         defer alloc.free(given);
-        number_mode = convert.NumberMode.parse(given) orelse {
+        number_mode = column.NumberMode.parse(given) orelse {
             msg.set("duckdb_oracle: oracle_query: unconstrained_number must be 'double', 'lossy_double' or 'varchar', got '{s}'", .{given});
             return error.Bind;
         };
@@ -365,7 +366,7 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
         return error.Bind;
     }
 
-    bind.plans = try alloc.alloc(convert.ColumnPlan, ncols);
+    bind.plans = try alloc.alloc(column.Column, ncols);
     bind.names = try alloc.alloc([]u8, ncols);
     @memset(bind.names, &.{}); // destroy() frees every entry, also after a partial failure
     var col: u32 = 0;
@@ -376,38 +377,70 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
             return error.Bind;
         }
         const name: []const u8 = if (qi.name) |n| n[0..qi.nameLength] else "";
-        const plan = convert.planColumnOpts(&qi.typeInfo, .{ .number = number_mode }) catch {
-            msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, convert.oracleTypeName(qi.typeInfo.oracleTypeNum) });
+        const plan = column.fromTypeInfo(&qi.typeInfo, .{ .number = number_mode }) catch {
+            msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, column.oracleTypeName(qi.typeInfo.oracleTypeNum) });
             return error.Bind;
         };
         bind.plans[col] = plan;
         bind.names[col] = try alloc.dupe(u8, name);
 
-        var lt = planLogicalType(&plan);
+        var lt = columnLogicalType(&plan);
         defer duck("duckdb_destroy_logical_type")(&lt);
         const namez = try compat.dupeZ(alloc, if (name.len == 0) "column" else name);
         defer alloc.free(namez);
         duck("duckdb_bind_add_result_column")(info, namez.ptr, lt);
     }
 
-    bind.fetch_rows = convert.fetchRows(bind.plans, bind.vector_size, fetch_budget_bytes);
+    bind.fetch_rows = column.fetchRows(bind.plans, bind.vector_size, fetch_budget_bytes);
     bind.sql = sql;
     sql_owned = null;
     bind_owned = false;
     duck("duckdb_bind_set_bind_data")(info, bind, destroyQueryBind);
 }
 
-fn planLogicalType(plan: *const convert.ColumnPlan) c.duckdb_logical_type {
-    return switch (plan.kind) {
-        .decimal => duck("duckdb_create_decimal_type")(plan.width, plan.scale),
-        .list => blk: {
-            var child = logicalType(plan.list_elem.duckdbType());
-            defer duck("duckdb_destroy_logical_type")(&child);
-            break :blk duck("duckdb_create_list_type")(child);
-        },
-        else => logicalType(plan.kind.duckdbType()),
-    };
+fn columnLogicalType(col: *const column.Column) c.duckdb_logical_type {
+    const spec = col.logicalSpec();
+    if (spec.child) |child_id| {
+        var child = logicalType(child_id);
+        defer duck("duckdb_destroy_logical_type")(&child);
+        return duck("duckdb_create_list_type")(child);
+    }
+    if (spec.id == c.DUCKDB_TYPE_DECIMAL) return duck("duckdb_create_decimal_type")(spec.width, spec.scale);
+    return logicalType(spec.id);
 }
+
+/// column.zig's vector sink over a DuckDB vector.
+const DuckSink = struct {
+    vec: c.duckdb_vector,
+    base: [*]u8,
+
+    fn init(vec: c.duckdb_vector) ?DuckSink {
+        const p = duck("duckdb_vector_get_data")(vec) orelse return null;
+        return .{ .vec = vec, .base = @ptrCast(p) };
+    }
+    pub fn data(self: *DuckSink) [*]u8 {
+        return self.base;
+    }
+    pub fn setNull(self: *DuckSink, row: u32) void {
+        setInvalid(self.vec, row);
+    }
+    pub fn string(self: *DuckSink, row: u32, bytes: []const u8) void {
+        assignString(self.vec, row, bytes);
+    }
+    pub fn listSize(self: *DuckSink) u64 {
+        return duck("duckdb_list_vector_get_size")(self.vec);
+    }
+    pub fn listReserve(self: *DuckSink, total: u64) bool {
+        return duck("duckdb_list_vector_reserve")(self.vec, total) == c.DuckDBSuccess;
+    }
+    pub fn listChildData(self: *DuckSink) ?[*]u8 {
+        const child = duck("duckdb_list_vector_get_child")(self.vec);
+        return @ptrCast(duck("duckdb_vector_get_data")(child));
+    }
+    pub fn listSetSize(self: *DuckSink, n: u64) void {
+        _ = duck("duckdb_list_vector_set_size")(self.vec, n);
+    }
+};
 
 const QueryScan = struct {
     cursor: *OdpiCursor,
@@ -476,84 +509,19 @@ fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, 
         return;
     }
 
-    for (bind.plans, 0..) |*plan, col| {
+    const reader: OdpiReader = .{};
+    const wctx: column.Column.WriteCtx = .{ .gpa = alloc, .json_buf = &scan.json_buf };
+    for (bind.plans, 0..) |*col_plan, col| {
         const vec = duck("duckdb_data_chunk_get_vector")(output, col);
-        const out: [*]u8 = @ptrCast(duck("duckdb_vector_get_data")(vec) orelse return error.Missing);
+        var sink = DuckSink.init(vec) orelse return error.Missing;
         const data = scan.cursor.column(col) orelse return error.Missing;
-        // LIST (VECTOR) state
-        const child: c.duckdb_vector = if (plan.kind == .list) duck("duckdb_list_vector_get_child")(vec) else null;
-        var list_size: u64 = if (plan.kind == .list) duck("duckdb_list_vector_get_size")(vec) else 0;
-        const entries: [*]c.duckdb_list_entry = @ptrCast(@alignCast(out));
         var r: u32 = 0;
         while (r < nrows) : (r += 1) {
             const d = &data[buffer_row + r];
-            if (d.isNull != 0) {
-                if (plan.kind == .list) entries[r] = .{ .offset = list_size, .length = 0 };
-                setInvalid(vec, r);
-                continue;
-            }
-            switch (plan.kind) {
-                .list => {
-                    var vi = std.mem.zeroes(c.dpiVectorInfo);
-                    if (c.dpiVector_getValue(d.value.asVector, &vi) != c.DPI_SUCCESS) {
-                        oracle.setDpiError(msg, bind.ctx, "read VECTOR");
-                        return error.Fetch;
-                    }
-                    const n = convert.vectorLen(&vi, plan.list_elem) catch |e| {
-                        msg.set("duckdb_oracle: column {d}: cannot convert VECTOR ({s})", .{ col + 1, @errorName(e) });
-                        return error.Fetch;
-                    };
-                    if (duck("duckdb_list_vector_reserve")(vec, list_size + n) != c.DuckDBSuccess) {
-                        msg.set("duckdb_oracle: column {d}: out of memory for VECTOR", .{col + 1});
-                        return error.Fetch;
-                    }
-                    const child_data: [*]u8 = @ptrCast(duck("duckdb_vector_get_data")(child) orelse return error.Missing);
-                    convert.convertVector(&vi, plan.list_elem, child_data + list_size * plan.list_elem.size()) catch |e| {
-                        msg.set("duckdb_oracle: column {d}: cannot convert VECTOR ({s})", .{ col + 1, @errorName(e) });
-                        return error.Fetch;
-                    };
-                    entries[r] = .{ .offset = list_size, .length = n };
-                    list_size += n;
-                    _ = duck("duckdb_list_vector_set_size")(vec, list_size);
-                },
-                .varchar, .blob => {
-                    if (plan.is_json) {
-                        var top: [*c]c.dpiJsonNode = null;
-                        if (c.dpiJson_getValue(d.value.asJson, convert.json_get_options, &top) != c.DPI_SUCCESS or top == null) {
-                            oracle.setDpiError(msg, bind.ctx, "read JSON");
-                            return error.Fetch;
-                        }
-                        scan.json_buf.clearRetainingCapacity();
-                        convert.serializeJson(alloc, &scan.json_buf, @ptrCast(top)) catch |e| {
-                            msg.set("duckdb_oracle: column {d}: cannot serialise JSON ({s})", .{ col + 1, @errorName(e) });
-                            return error.Fetch;
-                        };
-                        assignString(vec, r, scan.json_buf.items);
-                    } else if (plan.is_rowid) {
-                        var p: [*c]const u8 = null;
-                        var l: u32 = 0;
-                        if (c.dpiRowid_getStringValue(d.value.asRowid, &p, &l) != c.DPI_SUCCESS) {
-                            oracle.setDpiError(msg, bind.ctx, "convert ROWID");
-                            return error.Fetch;
-                        }
-                        assignString(vec, r, if (p == null) "" else p[0..l]);
-                    } else {
-                        const b = d.value.asBytes;
-                        assignString(vec, r, if (b.ptr == null) "" else b.ptr[0..b.length]);
-                    }
-                },
-                else => convert.storeFixed(plan, &d.value, out, r) catch |e| {
-                    if (e == error.PrecisionLoss) {
-                        const b = d.value.asBytes;
-                        const shown: []const u8 = if (b.ptr == null) "" else b.ptr[0..@min(b.length, 64)];
-                        msg.set("duckdb_oracle: column {d} (\"{s}\"): NUMBER value {s} cannot be represented exactly as DOUBLE (it would be silently rounded). " ++
-                            "Use CAST(... AS NUMBER(38)) in the Oracle query, or pass unconstrained_number := 'varchar' (exact text) or 'lossy_double' (accept rounding)", .{ col + 1, bind.names[col], shown });
-                    } else {
-                        msg.set("duckdb_oracle: column {d}: cannot convert value ({s})", .{ col + 1, @errorName(e) });
-                    }
-                    return error.Fetch;
-                },
-            }
+            col_plan.write(&sink, reader, wctx, r, d) catch |e| {
+                describeWriteError(msg, bind, col, d, e);
+                return error.Fetch;
+            };
         }
     }
     duck("duckdb_data_chunk_set_size")(output, nrows);
@@ -561,6 +529,27 @@ fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, 
     // The values were copied into DuckDB vectors; if the result is exhausted the
     // cursor gives its handles back to Oracle right away.
     scan.cursor.endBatch();
+}
+
+/// Turn a column.write failure into the DuckDB error text.
+fn describeWriteError(msg: *Msg, bind: *const QueryBind, col: usize, d: *const c.dpiData, e: column.Column.WriteError) void {
+    const name = bind.names[col];
+    switch (e) {
+        error.ReadVector => oracle.setDpiError(msg, bind.ctx, "read VECTOR"),
+        error.ReadJson => oracle.setDpiError(msg, bind.ctx, "read JSON"),
+        error.ReadRowid => oracle.setDpiError(msg, bind.ctx, "convert ROWID"),
+        error.PrecisionLoss => {
+            const b = d.value.asBytes;
+            const shown: []const u8 = if (b.ptr == null) "" else b.ptr[0..@min(b.length, 64)];
+            msg.set("duckdb_oracle: column {d} (\"{s}\"): NUMBER value {s} cannot be represented exactly as DOUBLE (it would be silently rounded). " ++
+                "Use CAST(... AS NUMBER(38)) in the Oracle query, or pass unconstrained_number := 'varchar' (exact text) or 'lossy_double' (accept rounding)", .{ col + 1, name, shown });
+        },
+        error.IntervalOverflow => msg.set("duckdb_oracle: column {d} (\"{s}\"): INTERVAL YEAR TO MONTH value is outside the range of a DuckDB INTERVAL (its months must fit in 32 bits, about 178 million years)", .{ col + 1, name }),
+        error.ListReserve => msg.set("duckdb_oracle: column {d} (\"{s}\"): out of memory for VECTOR", .{ col + 1, name }),
+        error.VectorFormatMismatch, error.VectorTooLarge, error.InvalidSparseIndex, error.NullDimensions => msg.set("duckdb_oracle: column {d} (\"{s}\"): cannot convert VECTOR ({s})", .{ col + 1, name, @errorName(e) }),
+        error.OutOfMemory, error.UnsupportedJsonNode, error.JsonTooDeep => msg.set("duckdb_oracle: column {d} (\"{s}\"): cannot serialise JSON ({s})", .{ col + 1, name, @errorName(e) }),
+        else => msg.set("duckdb_oracle: column {d} (\"{s}\"): cannot convert value ({s})", .{ col + 1, name, @errorName(e) }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -637,10 +626,6 @@ fn infoFunction(info: c.duckdb_function_info, output: c.duckdb_data_chunk) callc
     assignString(vecs.get(output, 7), 0, build_options.capi_version);
     assignString(vecs.get(output, 8), 0, ci.message.slice());
     duck("duckdb_data_chunk_set_size")(output, 1);
-}
-
-test {
-    _ = convert;
 }
 
 // Windows: suppress Zig's own `_DllMainCRTStartup` (std/start.zig) so that the

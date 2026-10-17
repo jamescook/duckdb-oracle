@@ -18,7 +18,7 @@
 //!   describeError(msg, comptime what) void   (fills `msg` from the backend's last error)
 const std = @import("std");
 const c = @import("c.zig").c;
-const convert = @import("convert.zig");
+const colmod = @import("column.zig");
 const Msg = @import("oracle.zig").Msg;
 
 pub const Error = error{ Open, Fetch, OutOfMemory };
@@ -52,7 +52,7 @@ pub fn Cursor(comptime B: type) type {
             a: std.mem.Allocator,
             backend: B,
             sql: []const u8,
-            plans: []const convert.ColumnPlan,
+            plans: []const colmod.Column,
             fetch_rows: u32,
             msg: *Msg,
         ) Error!*Self {
@@ -210,7 +210,7 @@ const Fake = struct {
         try self.tick();
         return self.st.exec_cols_override orelse 2;
     }
-    pub fn newVar(self: Fake, plan: *const convert.ColumnPlan, rows: u32) error{Failed}!struct { handle: Var, data: [*]c.dpiData } {
+    pub fn newVar(self: Fake, plan: *const colmod.Column, rows: u32) error{Failed}!struct { handle: Var, data: [*]c.dpiData } {
         _ = plan;
         try self.tick();
         const id = self.st.next_var;
@@ -275,8 +275,8 @@ const Fake = struct {
 
 const FakeCursor = Cursor(Fake);
 
-fn twoPlans() [2]convert.ColumnPlan {
-    const plan: convert.ColumnPlan = .{ .kind = .bigint, .oracle_type = c.DPI_ORACLE_TYPE_NUMBER, .native_type = c.DPI_NATIVE_TYPE_INT64 };
+fn twoPlans() [2]colmod.Column {
+    const plan: colmod.Column = .{ .kind = .bigint, .oracle_type = c.DPI_ORACLE_TYPE_NUMBER, .native_type = c.DPI_NATIVE_TYPE_INT64 };
     return .{ plan, plan };
 }
 
