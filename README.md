@@ -251,7 +251,7 @@ The password is read from the environment only. `password := '...'` from earlier
 ```sql
 SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT owner, table_name FROM all_tables');
 SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM dual', user := 'SAMPLE_DEV');
-CREATE TABLE t AS SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM aims.orders');
+CREATE TABLE t AS SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT * FROM sample.orders');
 ```
 
 How it works:
