@@ -17,8 +17,8 @@ IC=$(readlink -f "${3:?instantclient dir}")
 WINE=${4:-wine64}
 export WINEPREFIX=${WINEPREFIX:-/tmp/wineprefix-locator} WINEDEBUG=-all WINEARCH=win64 DISPLAY= LANG=C.UTF-8
 
-. "$(dirname "$0")/shipped-ext.sh"
-resolve_shipped_ext "$SRC" || { echo "FAIL: artifact is not shippable as-is"; exit 1; }
+EXT=$(python3 "$(dirname "$0")/verify_artifact.py" extract "$SRC") || { echo "FAIL: artifact is not shippable as-is"; exit 1; }
+case "$SRC" in *.zip) trap 'rm -rf "$(dirname "$EXT")"' EXIT ;; esac
 [ -f "$IC/oci.dll" ] || { echo "FAIL: $IC/oci.dll not found"; exit 1; }
 
 W=$(mktemp -d /tmp/locator-test.XXXXXX)

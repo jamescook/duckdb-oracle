@@ -9,8 +9,7 @@ set -u
 DUCKDB=${1:?duckdb binary}
 SRC=${2:?zip or extension file}
 fail() { echo "FAIL: $*"; exit 1; }
-. "$(dirname "$0")/shipped-ext.sh"
-resolve_shipped_ext "$SRC" || fail "artifact is not shippable as-is"
+EXT=$(python3 "$(dirname "$0")/verify_artifact.py" extract "$SRC") || fail "artifact is not shippable as-is"
 
 PORT=$((20000 + RANDOM % 20000))
 python3 - "$PORT" <<'PY' &
@@ -22,7 +21,8 @@ while True:
     keep.append(s.accept()[0])
 PY
 SRV=$!
-trap 'kill $SRV 2>/dev/null' EXIT
+cleanup() { kill $SRV 2>/dev/null; case "$SRC" in *.zip) rm -rf "$(dirname "$EXT")" ;; esac; }
+trap cleanup EXIT
 sleep 1
 
 run() { # <seconds budget> <sql>; prints elapsed seconds and output

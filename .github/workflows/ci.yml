@@ -44,23 +44,20 @@ jobs:
       - name: Build all platforms (default C API target)
         run: zig build -Dplatform=linux_amd64 -Dplatform=linux_amd64_gcc4 -Dplatform=windows_amd64 -Dplatform=windows_arm64 --summary all
 
-      - name: Check footers
-        run: |
-          python3 tools/check_footer.py zig-out/linux_amd64/duckdb_oracle.duckdb_extension --platform linux_amd64 --version $TARGET_CAPI
-          python3 tools/check_footer.py zig-out/linux_amd64_gcc4/duckdb_oracle.duckdb_extension --platform linux_amd64_gcc4 --version $TARGET_CAPI
-          python3 tools/check_footer.py zig-out/windows_amd64/duckdb_oracle.duckdb_extension --platform windows_amd64 --version $TARGET_CAPI
-          python3 tools/check_footer.py zig-out/windows_arm64/duckdb_oracle.duckdb_extension --platform windows_arm64 --version $TARGET_CAPI
+      - name: Verifier unit tests (the rules that gate every artifact)
+        run: DUCKDB_ORACLE_WINDOWS_DLL=$PWD/zig-out/windows_amd64/duckdb_oracle.duckdb_extension python3 -m unittest discover -s tools -v
 
-      - name: Inspect Windows DLLs (machine type, PE32+, exports, imports, footer)
+      - name: Verify artifacts - shipped name, footer, and for Windows the PE image
         run: |
-          tools/check-pe.sh zig-out/windows_amd64/duckdb_oracle.duckdb_extension $TARGET_CAPI windows_amd64
-          tools/check-pe.sh zig-out/windows_arm64/duckdb_oracle.duckdb_extension $TARGET_CAPI windows_arm64
+          for p in linux_amd64 linux_amd64_gcc4 windows_amd64 windows_arm64; do
+            python3 tools/verify_artifact.py check zig-out/dist/duckdb_oracle-$p.zip --platform $p --capi-version $TARGET_CAPI
+          done
 
       - name: Every -Dduckdb-version in range compiles (stable API only)
         run: |
           for v in v1.2.0 v1.3.0 v1.4.0 v1.5.0 v1.5.6; do
             zig build -Dplatform=linux_amd64 -Dduckdb-version=$v --prefix /tmp/zo-$v
-            python3 tools/check_footer.py /tmp/zo-$v/linux_amd64/duckdb_oracle.duckdb_extension --platform linux_amd64 --version $v
+            python3 tools/verify_artifact.py check /tmp/zo-$v/linux_amd64/duckdb_oracle.duckdb_extension --platform linux_amd64 --capi-version $v
           done
 
       - uses: actions/upload-artifact@v4
@@ -75,21 +72,7 @@ jobs:
           unzip -o duckdb.zip -d duckdb-cli
           ./duckdb-cli/duckdb -version
 
-      - name: Stock-CLI load test (Linux, baseline CLI, this Zig's binary)
-        run: tools/stock-cli-test.sh ./duckdb-cli/duckdb "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip"
-
-      # Regression guard: a platform-suffixed file name must be rejected by the
-      # load test (DuckDB would look for duckdb_oracle-<platform>_init_c_api).
-      - name: Negative control - misnamed artifact must fail the load test
-        run: |
-          cp zig-out/linux_amd64/duckdb_oracle.duckdb_extension /tmp/duckdb_oracle-linux_amd64.duckdb_extension
-          if tools/stock-cli-test.sh ./duckdb-cli/duckdb /tmp/duckdb_oracle-linux_amd64.duckdb_extension; then
-            echo "load test accepted a misnamed artifact"; exit 1
-          fi
-          ./duckdb-cli/duckdb -unsigned -c "LOAD '/tmp/duckdb_oracle-linux_amd64.duckdb_extension';" 2>&1 | tee /tmp/neg.txt || true
-          grep -q 'duckdb_oracle-linux_amd64_init_c_api' /tmp/neg.txt
-
-      - name: Client matrix (no client, Instant Client 19.26, latest Instant Client)
+      - name: Install Oracle Instant Client (19.26 and latest) for the client matrix
         run: |
           sudo apt-get install -y -q libaio1t64 || sudo apt-get install -y -q libaio1
           mkdir -p ic
@@ -97,7 +80,14 @@ jobs:
           curl -fsSL -o iclatest.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
           unzip -qo ic19.zip -d ic && unzip -qo iclatest.zip -d ic
           for d in ic/instantclient_*; do [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 "$d/libaio.so.1"; done
-          tools/client-matrix.sh ./duckdb-cli/duckdb "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip" none $PWD/ic/instantclient_*
+
+      # Loads the shipped zip's file into the stock CLI (not preinstalled, LOAD exit 0,
+      # loaded = true), runs the negative control (a platform-suffixed copy must fail with
+      # duckdb_oracle-<platform>_init_c_api) and the per-client checks.
+      - name: Stock-CLI load test, negative control and client matrix (no client, Instant Client 19.26, latest)
+        run: |
+          python3 tools/verify_artifact.py check "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip" --platform linux_amd64 --capi-version $TARGET_CAPI \
+            --duckdb ./duckdb-cli/duckdb --client none $(for d in $PWD/ic/instantclient_*; do echo --client $d; done)
 
       - name: Timeout regression (silent listener must not hang the session)
         run: |
@@ -131,7 +121,7 @@ jobs:
           name: duckdb-oracle-extensions-zig-${{ matrix.zig }}
           path: artifacts
 
-      - name: Linux - download CLI and run tools/stock-cli-test.sh
+      - name: Download the official CLI and verify the shipped artifact (Linux)
         if: runner.os == 'Linux'
         run: |
           curl -fsSL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/${{ matrix.duckdb }}/duckdb_cli-linux-amd64.zip
@@ -139,29 +129,17 @@ jobs:
           ./duckdb-cli/duckdb -version
           platform=$(./duckdb-cli/duckdb -csv -noheader -c "PRAGMA platform;")
           echo "CLI platform: $platform"   # v1.2.x Linux CLIs report linux_amd64_gcc4
-          chmod +x tools/*.sh
-          tools/stock-cli-test.sh ./duckdb-cli/duckdb "$PWD/artifacts/dist/duckdb_oracle-$platform.zip"
+          python3 tools/verify_artifact.py check "$PWD/artifacts/dist/duckdb_oracle-$platform.zip" --platform $platform --capi-version $TARGET_CAPI --duckdb ./duckdb-cli/duckdb --client none
 
-      - name: Windows - brief's LOAD command
+      - name: Download the official CLI and verify the shipped artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/duckdb/duckdb/releases/download/${{ matrix.duckdb }}/duckdb_cli-windows-amd64.zip" -OutFile duckdb.zip
           Expand-Archive duckdb.zip -DestinationPath duckdb-cli -Force
           .\duckdb-cli\duckdb.exe -version
-          # unpack the shipped zip and LOAD the file under its exact shipped name
-          Expand-Archive artifacts/dist/duckdb_oracle-windows_amd64.zip -DestinationPath pkg -Force
-          $names = @(Get-ChildItem pkg | ForEach-Object Name)
-          if (($names -join ',') -ne 'duckdb_oracle.duckdb_extension') { throw "zip must contain exactly duckdb_oracle.duckdb_extension, got: $names" }
-          $ext = (Resolve-Path pkg/duckdb_oracle.duckdb_extension).Path.Replace('\', '/')
-          $pre = .\duckdb-cli\duckdb.exe -csv -noheader -c "SELECT count(*) FROM duckdb_extensions() WHERE extension_name='duckdb_oracle' AND (loaded OR installed);"
-          if ($pre.Trim() -ne '0') { throw "duckdb_oracle already present in stock CLI: $pre" }
-          .\duckdb-cli\duckdb.exe -unsigned -c "LOAD '$ext'; SELECT * FROM duckdb_extensions() WHERE extension_name='duckdb_oracle'; SELECT * FROM oracle_client_info();"
-          $code = $LASTEXITCODE
-          'Exit code: {0} (0x{1})' -f $code, $code.ToString('X8')
-          if ($code -ne 0) { exit 1 }
-          $loaded = .\duckdb-cli\duckdb.exe -unsigned -csv -noheader -c "LOAD '$ext'; SELECT loaded FROM duckdb_extensions() WHERE extension_name='duckdb_oracle';"
-          if ($loaded.Trim() -ne 'true') { throw "loaded=$loaded" }
+          python tools/verify_artifact.py check artifacts/dist/duckdb_oracle-windows_amd64.zip --platform windows_amd64 --capi-version $env:TARGET_CAPI --duckdb .\duckdb-cli\duckdb.exe --client none
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Windows - test-windows.ps1 -SkipOracle (PowerShell 7)
         if: runner.os == 'Windows'

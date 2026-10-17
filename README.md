@@ -42,10 +42,12 @@ zig build -Dplatform=linux_amd64_gcc4     # Linux binary labelled for DuckDB v1.
 zig build -Dduckdb-version=v1.4.0         # target a specific (minimum) DuckDB version
 zig build test                            # Zig unit tests (type conversion)
 zig build sqllogictest -Dpython=.venv/bin/python   # SQLLogicTests, needs duckdb (1.5.6 tested) + runner
-tools/stock-cli-test.sh ./duckdb zig-out/dist/duckdb_oracle-linux_amd64.zip   # loads the exact shipped file
-tools/check-pe.sh zig-out/windows_amd64/duckdb_oracle.duckdb_extension v1.2.0 windows_amd64   # machine/exports/imports/footer
-tools/check-pe.sh zig-out/windows_arm64/duckdb_oracle.duckdb_extension v1.2.0 windows_arm64   # same checks for ARM64 (machine 0xAA64)
-python3 tools/check_footer.py <file> --platform windows_amd64 --version v1.2.0
+python3 tools/verify_artifact.py check zig-out/dist/duckdb_oracle-linux_amd64.zip --platform linux_amd64 \
+    --duckdb ./duckdb --client none --client /path/to/instantclient_19_26   # name rule, footer, stock-CLI load, negative control, client checks
+python3 tools/verify_artifact.py check zig-out/dist/duckdb_oracle-windows_amd64.zip --platform windows_amd64   # name rule, footer, PE machine/exports/imports
+python3 tools/verify_artifact.py check zig-out/dist/duckdb_oracle-windows_amd64.zip --platform windows_amd64 \
+    --duckdb duckdb.exe --wine wine64      # the official Windows CLI under Wine (a stand-in for Windows)
+python3 -m unittest discover -s tools     # the verifier's own tests (it must FAIL on bad artifacts)
 ```
 
 Options: `-Doptimize=Debug|ReleaseSafe|ReleaseFast`, `-Dextension-version=v0.1.0`
@@ -67,10 +69,12 @@ So each platform ships as a zip, with the platform in the zip name only:
 | `duckdb_oracle-linux_amd64_gcc4.zip` | `duckdb_oracle.duckdb_extension` | Linux x86-64, DuckDB 1.2.x (platform `linux_amd64_gcc4`) |
 
 Unzip the archive and load the file exactly as unzipped. Don't rename it. `zig build` writes the zips to
-`zig-out/dist/` using `tools/package.py`, which refuses any other inner name. The test tooling (`tools/stock-cli-test.sh`,
-`tools/client-matrix.sh`, `test-windows.ps1`, CI) takes the **zip** and loads the extracted file
-unchanged. It never renames anything, and it fails on a zip whose only entry isn't `duckdb_oracle.duckdb_extension`
-or on a misnamed file. CI also runs a negative control: a platform-suffixed copy must fail.
+`zig-out/dist/` using `tools/package.py`, which owns the shipped name and refuses any other inner name.
+`tools/verify_artifact.py` is the one place that checks the rules: it takes the **zip**, extracts the file unchanged,
+and fails on a zip whose only entry isn't `duckdb_oracle.duckdb_extension` or on a misnamed file; it also runs a
+negative control (a platform-suffixed copy must fail to load). CI, `tools/timeout-test.sh` and
+`tools/windows-locator-test.sh` all go through it. `test-windows.ps1` is deliberately standalone (it ships next to
+the zip and needs no Python), so it keeps its own copy of the unpack check.
 
 ## Zig versions
 
@@ -136,7 +140,7 @@ struct and the versioned function-pointer struct. No C++ objects, exceptions or 
 cross it, so the MSVC requirement for C++ DuckDB extensions does not apply. Zig ships the
 MinGW-w64 CRT and builds it against the Windows UCRT. The resulting DLL imports only
 `KERNEL32.dll`, `ntdll.dll` and the `api-ms-win-crt-*` UCRT API sets, which are part of
-Windows 10 and later (`tools/check-pe.sh` enforces this). No libgcc, libstdc++ or
+Windows 10 and later (`tools/verify_artifact.py` enforces this). No libgcc, libstdc++ or
 vcruntime DLL is needed. The footer platform is the standard `windows_amd64`, which the
 official CLI accepts. `windows_amd64_mingw` exists only for C++-ABI extensions built for
 MinGW DuckDB builds.
@@ -383,7 +387,8 @@ src/platform.c               Windows locator primitives (wide-char load, PE mach
 src/arch.zig                 process/host architecture + Windows-on-ARM hints (+ unit tests)
 test/sql/*.test              SQLLogicTests (no-client paths)
 tools/windows-locator-test.sh Windows client-locator scenarios with the real Windows duckdb.exe + Instant Client (Wine or Windows)
-tools/                       package.py (zip packaging), shipped-ext.sh, stock-CLI test, per-client matrix, PE inspection (pe_inspect.py, x64+ARM64), footer checker
+tools/verify_artifact.py     the artifact rules in one place: name, footer, PE, stock-CLI load, negative control, client checks (+ tests)
+tools/                       package.py (zip packaging, owns the shipped name), pe_inspect.py (x64+ARM64), check_footer.py, timeout-test.sh
 test-windows.ps1             Windows smoke test (stock CLI, oci.dll check, Oracle container)
 third_party/                 vendored DuckDB headers, ODPI-C, metadata script (see VERSIONS.md)
 .github/workflows/ci.yml     Linux build + tests, Windows stock-CLI load tests
