@@ -220,7 +220,7 @@ architecture of the first `oci.dll` on the search path when that doesn't match t
 
 ## SQL surface (v1)
 
-### `oracle_query(dsn, sql, user := ..., password_env := ...)`
+### `oracle_query(dsn, sql, user := ..., password_env := ..., connect_timeout := ..., timeout := ...)`
 
 Table function. It runs one Oracle query and returns its result set.
 
@@ -230,6 +230,8 @@ Table function. It runs one Oracle query and returns its result set.
 | `sql VARCHAR` | An Oracle `SELECT` / `WITH` query, using Oracle SQL dialect |
 | `user := VARCHAR` | Optional. Defaults to `$ORACLE_USER` |
 | `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
+| `connect_timeout := BIGINT` | Optional. Seconds allowed for the connection handshake. Default **30**, `0` = no limit. Added to Easy Connect strings as `connect_timeout=N` unless the DSN already sets it; TNS aliases and `(DESCRIPTION=...)` strings are used unchanged (set it in `sqlnet.ora`/the descriptor) |
+| `timeout := BIGINT` | Optional. Seconds allowed for each Oracle round trip on the session (describe, execute, every fetch), via `dpiConn_setCallTimeout`. Default **600**, `0` = no limit. A query that legitimately takes longer than this before returning its first row needs a larger value |
 
 **There is no `password` argument, on purpose.** DuckDB echoes the failing SQL text, literals included, in error
 messages (for example a wrong password, ORA-01017) and the CLI keeps a history, so a password written in SQL leaks.
@@ -337,8 +339,11 @@ error or the "unsupported Oracle type" message (expected behaviour, not verified
 * Strings that are not valid UTF-8 become NULL on DuckDB versions whose `duckdb_vector_assign_string_element_len`
   validates UTF-8 (v1.5.6 does; older releases may not). With UTF-8 client encoding this should not happen.
 * `TIMESTAMP WITH TIME ZONE` region names are lost, because DuckDB stores UTC instants.
-* Interrupting a long-running Oracle query (Ctrl+C) does not cancel the Oracle call. The interrupt
-  takes effect between fetches.
+* Interrupting (Ctrl+C) does not cancel an Oracle call: the C Extension API gives a table function no way to
+  observe an interrupt while it is blocked in OCI, so it only takes effect between fetches. A server that accepts
+  the connection and never answers used to hang the session forever (verified with a silent TCP listener, two
+  SIGINTs ignored). `connect_timeout` (default 30 s) and `timeout` (default 600 s per round trip) now bound that.
+  The call timeout has not been exercised against a live server.
 * Bind does not expose Oracle bind variables. Build the SQL text yourself, taking care with quoting.
 
 ## Future work

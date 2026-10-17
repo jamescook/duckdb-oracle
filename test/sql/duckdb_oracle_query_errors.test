@@ -41,6 +41,22 @@ SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', password_en
 ----
 password_env must not be NULL
 
+# Timeouts are seconds in [0, 4294967]; 0 means no limit
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', timeout := -1);
+----
+timeout must be between 0 and
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', connect_timeout := NULL);
+----
+connect_timeout must not be NULL
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', connect_timeout := 5000000000);
+----
+connect_timeout must be between 0 and
+
 # Unknown named parameters are rejected by DuckDB's binder
 statement error
 SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', schema := 'x');

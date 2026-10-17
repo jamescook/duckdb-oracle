@@ -7,6 +7,7 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const c = @import("c.zig").c;
 const arch = @import("arch.zig");
+const timeouts = @import("timeouts.zig");
 
 var mutex: compat.Mutex = .{};
 var context: ?*c.dpiContext = null;
@@ -85,7 +86,11 @@ pub fn getContext(msg: *Msg) ?*c.dpiContext {
 pub fn setDpiError(msg: *Msg, ctx: *c.dpiContext, comptime what: []const u8) void {
     var err = std.mem.zeroes(c.dpiErrorInfo);
     c.dpiContext_getError(ctx, &err);
-    msg.set("duckdb_oracle: " ++ what ++ ": {s}", .{trimMsg(@ptrCast(err.message), err.messageLength)});
+    const text = trimMsg(@ptrCast(err.message), err.messageLength);
+    if (timeouts.hintFor(text)) |hint|
+        msg.set("duckdb_oracle: " ++ what ++ ": {s} | hint: {s}", .{ text, hint })
+    else
+        msg.set("duckdb_oracle: " ++ what ++ ": {s}", .{text});
 }
 
 pub const ClientInfo = struct {

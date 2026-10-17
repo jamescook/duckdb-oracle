@@ -99,6 +99,11 @@ jobs:
           for d in ic/instantclient_*; do [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 "$d/libaio.so.1"; done
           tools/client-matrix.sh ./duckdb-cli/duckdb "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip" none $PWD/ic/instantclient_*
 
+      - name: Timeout regression (silent listener must not hang the session)
+        run: |
+          export LD_LIBRARY_PATH=$(ls -d $PWD/ic/instantclient_* | tail -1)
+          tools/timeout-test.sh ./duckdb-cli/duckdb "$PWD/zig-out/dist/duckdb_oracle-linux_amd64.zip"
+
       - name: SQLLogicTests (stock duckdb Python wheel)
         run: |
           python3 -m venv .venv

@@ -9,6 +9,7 @@ const c = @import("c.zig").c;
 const convert = @import("convert.zig");
 const oracle = @import("oracle.zig");
 const arch = @import("arch.zig");
+const timeouts = @import("timeouts.zig");
 const build_options = @import("build_options");
 
 const alloc = std.heap.c_allocator;
@@ -93,6 +94,12 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     // variable; `password_env` only chooses which one.
     duck("duckdb_table_function_add_named_parameter")(tf, "password_env", vt);
 
+    // Seconds; 0 disables. See timeouts.zig for why these exist.
+    var vi = logicalType(c.DUCKDB_TYPE_BIGINT);
+    defer duck("duckdb_destroy_logical_type")(&vi);
+    duck("duckdb_table_function_add_named_parameter")(tf, "connect_timeout", vi);
+    duck("duckdb_table_function_add_named_parameter")(tf, "timeout", vi);
+
     duck("duckdb_table_function_set_bind")(tf, queryBind);
     duck("duckdb_table_function_set_init")(tf, queryInit);
     duck("duckdb_table_function_set_function")(tf, queryFunction);
@@ -134,6 +141,23 @@ fn hasNamedParam(info: c.duckdb_bind_info, name: [*:0]const u8) bool {
     if (v == null) return false;
     duck("duckdb_destroy_value")(&v);
     return true;
+}
+
+/// Named BIGINT parameter holding a number of seconds in [0, max_call_secs].
+fn secondsParam(info: c.duckdb_bind_info, msg: *Msg, comptime name: [:0]const u8, default: u32) !u32 {
+    var v = duck("duckdb_bind_get_named_parameter")(info, name.ptr);
+    if (v == null) return default;
+    defer duck("duckdb_destroy_value")(&v);
+    if (duck("duckdb_is_null_value")(v)) {
+        msg.set("duckdb_oracle: oracle_query: " ++ name ++ " must not be NULL", .{});
+        return error.Bind;
+    }
+    const n = duck("duckdb_get_int64")(v);
+    if (n < 0 or n > timeouts.max_call_secs) {
+        msg.set("duckdb_oracle: oracle_query: " ++ name ++ " must be between 0 and {d} seconds (0 = no limit), got {d}", .{ timeouts.max_call_secs, n });
+        return error.Bind;
+    }
+    return @intCast(n);
 }
 
 fn positionalParam(info: c.duckdb_bind_info, idx: u64) ?[]u8 {
@@ -244,6 +268,9 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
         return error.Bind;
     }
 
+    const connect_secs = try secondsParam(info, msg, "connect_timeout", timeouts.default_connect_secs);
+    const call_secs = try secondsParam(info, msg, "timeout", timeouts.default_call_secs);
+
     // First Oracle use in this process loads OCI here.
     const ctx = oracle.getContext(msg) orelse {
         const tmp = msg.*;
@@ -270,12 +297,21 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     common.encoding = "UTF-8";
     common.nencoding = "UTF-8";
 
+    const connect_dsn = try timeouts.withConnectTimeout(alloc, dsn, connect_secs);
+    defer alloc.free(connect_dsn);
+
     var conn: ?*c.dpiConn = null;
-    if (c.dpiConn_create(ctx, user.?.ptr, len32(user.?), password.?.ptr, len32(password.?), dsn.ptr, len32(dsn), &common, null, &conn) != c.DPI_SUCCESS) {
+    if (c.dpiConn_create(ctx, user.?.ptr, len32(user.?), password.?.ptr, len32(password.?), connect_dsn.ptr, len32(connect_dsn), &common, null, &conn) != c.DPI_SUCCESS) {
         oracle.setDpiError(msg, ctx, "connect failed");
         return error.Bind;
     }
     bind.conn = conn;
+
+    // Bounds every later round trip on this session (describe, execute, each fetch).
+    if (call_secs > 0 and c.dpiConn_setCallTimeout(conn, timeouts.callTimeoutMs(call_secs)) != c.DPI_SUCCESS) {
+        oracle.setDpiError(msg, ctx, "set call timeout");
+        return error.Bind;
+    }
 
     // Describe the query without executing it.
     var stmt: ?*c.dpiStmt = null;
