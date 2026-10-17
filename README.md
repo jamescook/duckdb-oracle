@@ -230,6 +230,7 @@ Table function. It runs one Oracle query and returns its result set.
 | `sql VARCHAR` | An Oracle `SELECT` / `WITH` query, using Oracle SQL dialect |
 | `user := VARCHAR` | Optional. Defaults to `$ORACLE_USER` |
 | `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
+| `unconstrained_number := VARCHAR` | Optional. How a `NUMBER` with no exact `DECIMAL` form is returned (see Type mapping): `'double'` (default, checked), `'lossy_double'` or `'varchar'` |
 | `connect_timeout := BIGINT` | Optional. Seconds allowed for the connection handshake. Default **30**, `0` = no limit. Added to Easy Connect strings as `connect_timeout=N` unless the DSN already sets it; TNS aliases and `(DESCRIPTION=...)` strings are used unchanged (set it in `sqlnet.ora`/the descriptor) |
 | `timeout := BIGINT` | Optional. Seconds allowed for each Oracle round trip on the session (describe, execute, every fetch), via `dpiConn_setCallTimeout`. Default **600**, `0` = no limit. A query that legitimately takes longer than this before returning its first row needs a larger value |
 
@@ -282,7 +283,7 @@ Table function that returns one row and never fails. It is the first thing to ru
 |---|---|---|
 | `NUMBER(p,0)`, p ≤ 18 (also `NUMBER(p,-s)` with p+s ≤ 18) | `BIGINT` | fetched as int64 |
 | `NUMBER(p,s)`, s > 0, max(p,s) ≤ 38; `NUMBER(19..38,0)` | `DECIMAL(max(p,s), s)` | exact: fetched as text, parsed to the scaled integer, stored as int16/32/64/128 |
-| `NUMBER` (no precision), `FLOAT(b)`, `NUMBER(p,-s)` with p+s > 38 | `DOUBLE` | Oracle reports expressions such as `COUNT(*)` or `1/3` as unconstrained `NUMBER`, so these arrive as `DOUBLE`. Use `CAST(x AS NUMBER(p,s))` in the Oracle SQL for exact types |
+| `NUMBER` (no precision), `FLOAT(b)`, `NUMBER(p,-s)` with p+s > 38, `NUMBER(p,s)` wider than 38 | `DOUBLE` (checked) | Oracle reports expressions such as `COUNT(*)` or `1/3`, and bare `NUMBER` columns, as unconstrained, so these arrive as `DOUBLE`. They are fetched as text and an **integral value a double cannot hold exactly (for example `9007199254740993`) is an error**, not a silently rounded number. Fractions are approximate, as in any `DOUBLE`. Use `CAST(x AS NUMBER(p,s))` in the Oracle SQL for exact types, or `unconstrained_number := 'varchar'` for exact text, or `'lossy_double'` for the previous silently-rounding behaviour |
 | `BINARY_DOUBLE` | `DOUBLE` | |
 | `BINARY_FLOAT` | `FLOAT` | |
 | `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR` | `VARCHAR` | UTF-8 (ODPI-C `encoding`/`nencoding` = UTF-8). `CHAR` keeps Oracle's blank padding |

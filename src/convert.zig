@@ -13,6 +13,8 @@ pub const DuckKind = enum {
     double,
     float,
     boolean,
+    /// DOUBLE fetched as NUMBER text and checked for silent integer rounding
+    number_double,
     varchar,
     blob,
     timestamp,
@@ -25,7 +27,7 @@ pub const DuckKind = enum {
         return switch (self) {
             .bigint => c.DUCKDB_TYPE_BIGINT,
             .decimal => c.DUCKDB_TYPE_DECIMAL,
-            .double => c.DUCKDB_TYPE_DOUBLE,
+            .double, .number_double => c.DUCKDB_TYPE_DOUBLE,
             .float => c.DUCKDB_TYPE_FLOAT,
             .boolean => c.DUCKDB_TYPE_BOOLEAN,
             .varchar => c.DUCKDB_TYPE_VARCHAR,
@@ -87,11 +89,36 @@ pub const max_bigint_precision = 18;
 /// DuckDB's maximum DECIMAL width.
 pub const max_decimal_width = 38;
 
+/// How NUMBER columns that have no exact DECIMAL form are materialised: a bare
+/// NUMBER, FLOAT(b), COUNT(*)/SUM() expressions, NUMBER(p,s) wider than 38 digits.
+pub const NumberMode = enum {
+    /// DOUBLE; an integral value that a double cannot hold exactly is an error
+    /// instead of being silently rounded (the default).
+    double,
+    /// DOUBLE with silent rounding (fast path: OCI converts to double itself).
+    lossy_double,
+    /// Exact NUMBER text as VARCHAR.
+    varchar,
+
+    pub fn parse(text: []const u8) ?NumberMode {
+        inline for (@typeInfo(NumberMode).@"enum".fields) |f| {
+            if (std.ascii.eqlIgnoreCase(text, f.name)) return @field(NumberMode, f.name);
+        }
+        return null;
+    }
+};
+
+pub const PlanOptions = struct { number: NumberMode = .double };
+
 /// Decide the DuckDB type and the ODPI-C define parameters for a column.
 pub fn planColumn(ti: *const c.dpiDataTypeInfo) PlanError!ColumnPlan {
+    return planColumnOpts(ti, .{});
+}
+
+pub fn planColumnOpts(ti: *const c.dpiDataTypeInfo, opts: PlanOptions) PlanError!ColumnPlan {
     const ot = ti.oracleTypeNum;
     switch (ot) {
-        c.DPI_ORACLE_TYPE_NUMBER => return planNumber(ti.precision, ti.scale),
+        c.DPI_ORACLE_TYPE_NUMBER => return planNumber(ti.precision, ti.scale, opts.number),
         c.DPI_ORACLE_TYPE_NATIVE_DOUBLE => return .{ .kind = .double, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_DOUBLE },
         c.DPI_ORACLE_TYPE_NATIVE_FLOAT => return .{ .kind = .float, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_FLOAT },
         c.DPI_ORACLE_TYPE_NATIVE_INT, c.DPI_ORACLE_TYPE_NATIVE_UINT => return .{ .kind = .bigint, .oracle_type = c.DPI_ORACLE_TYPE_NUMBER, .native_type = c.DPI_NATIVE_TYPE_INT64 },
@@ -160,9 +187,14 @@ pub fn vectorElem(format: u8) ListElem {
     };
 }
 
-fn planNumber(precision: i16, scale: i8) ColumnPlan {
+fn planNumber(precision: i16, scale: i8, mode: NumberMode) ColumnPlan {
     const ot = c.DPI_ORACLE_TYPE_NUMBER;
-    const dbl: ColumnPlan = .{ .kind = .double, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_DOUBLE };
+    // Fallback for NUMBERs with no exact DECIMAL form (see NumberMode).
+    const dbl: ColumnPlan = switch (mode) {
+        .double => .{ .kind = .number_double, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_BYTES },
+        .lossy_double => .{ .kind = .double, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_DOUBLE },
+        .varchar => .{ .kind = .varchar, .oracle_type = ot, .native_type = c.DPI_NATIVE_TYPE_BYTES },
+    };
     // NUMBER without precision (p=0, s=-127) and FLOAT(b) (p>0, s=-127)
     if (precision <= 0 or scale == -127) return dbl;
     const p: i32 = precision;
@@ -186,7 +218,9 @@ fn planNumber(precision: i16, scale: i8) ColumnPlan {
 /// Approximate per-row fetch buffer bytes ODPI-C allocates for a column.
 pub fn rowBufferBytes(plan: *const ColumnPlan) u64 {
     const overhead: u64 = 24; // dpiData + indicator/length/return code
-    if (plan.kind == .decimal) return overhead + 172; // DPI_NUMBER_AS_TEXT_CHARS
+    // NUMBER fetched as text: ODPI-C allocates DPI_NUMBER_AS_TEXT_CHARS per row
+    if (plan.kind == .decimal or plan.kind == .number_double or
+        (plan.oracle_type == c.DPI_ORACLE_TYPE_NUMBER and plan.native_type == c.DPI_NATIVE_TYPE_BYTES)) return overhead + 172;
     if (plan.is_json or plan.kind == .list) return overhead + 256; // descriptor; value materialised per row
     // dynamic (LONG / LOB-as-LONG) buffers grow on demand; count a nominal chunk
     if (plan.oracle_type == c.DPI_ORACLE_TYPE_LONG_VARCHAR or plan.oracle_type == c.DPI_ORACLE_TYPE_LONG_NVARCHAR or
@@ -292,6 +326,65 @@ pub fn intervalYM(iv: *const c.dpiIntervalYM) c.duckdb_interval {
 
 pub const DecimalError = error{ InvalidNumber, DecimalOverflow };
 
+pub const NumberDoubleError = error{ InvalidNumber, PrecisionLoss };
+
+/// Convert ODPI-C NUMBER text ("-123.45", "1000", ".5") to a double. An integral
+/// value of up to 38 digits that a double cannot represent exactly is rejected
+/// with error.PrecisionLoss rather than silently rounded (9007199254740993 would
+/// otherwise become 9007199254740992). Fractions are inherently approximate in a
+/// DOUBLE and numbers of more than 38 digits are floating-point magnitudes, so
+/// both are accepted.
+pub fn parseNumberAsDouble(text: []const u8) NumberDoubleError!f64 {
+    var i: usize = 0;
+    var negative = false;
+    if (i < text.len and (text[i] == '-' or text[i] == '+')) {
+        negative = text[i] == '-';
+        i += 1;
+    }
+    var int_digits: u32 = 0; // significant integer digits (leading zeros skipped)
+    var acc: u128 = 0; // valid while int_digits <= max_decimal_width
+    var seen_point = false;
+    var seen_digit = false;
+    var fraction_nonzero = false;
+    for (text[i..]) |ch| {
+        if (ch == '.') {
+            if (seen_point) return error.InvalidNumber;
+            seen_point = true;
+            continue;
+        }
+        if (ch < '0' or ch > '9') return error.InvalidNumber;
+        seen_digit = true;
+        if (seen_point) {
+            if (ch != '0') fraction_nonzero = true;
+        } else if (int_digits > 0 or ch != '0') {
+            int_digits += 1;
+            if (int_digits <= max_decimal_width) acc = acc * 10 + (ch - '0');
+        }
+    }
+    if (!seen_digit) return error.InvalidNumber;
+
+    const magnitude: f64 = blk: {
+        if (fraction_nonzero or int_digits > max_decimal_width) {
+            // approximate by nature: a fraction, or a floating-point sized magnitude
+            var buf: [DPI_NUMBER_TEXT_MAX]u8 = undefined;
+            const digits = text[i..];
+            if (digits.len + 1 > buf.len) return error.InvalidNumber;
+            const prefix: usize = if (digits[0] == '.') 1 else 0; // "0" before a leading point
+            if (prefix == 1) buf[0] = '0';
+            @memcpy(buf[prefix .. prefix + digits.len], digits);
+            break :blk std.fmt.parseFloat(f64, buf[0 .. prefix + digits.len]) catch return error.InvalidNumber;
+        }
+        // integral, at most 38 digits: must survive the round trip through f64
+        const as_double: f64 = @floatFromInt(acc);
+        if (as_double >= 3.4e38 or @as(u128, @intFromFloat(as_double)) != acc) return error.PrecisionLoss;
+        break :blk as_double;
+    };
+    return if (negative) -magnitude else magnitude;
+}
+
+/// ODPI-C renders a NUMBER as at most this many characters (DPI_NUMBER_AS_TEXT_CHARS).
+const DPI_NUMBER_TEXT_MAX = 173;
+
 /// Parse ODPI-C's NUMBER-as-text output ("-123.45", "0.001", "1000") into the
 /// unscaled integer of a DECIMAL(width, scale). Extra fractional digits are
 /// rounded half away from zero (Oracle already enforces the column scale, so
@@ -376,7 +469,7 @@ pub fn storeDecimal(data: [*]u8, row: usize, width: u8, value: i128) void {
 
 /// Kinds that are written directly into the vector's data buffer (everything
 /// except strings/blobs which go through duckdb_vector_assign_string_element_len).
-pub const FixedError = DecimalError || error{NotFixed};
+pub const FixedError = DecimalError || NumberDoubleError || error{NotFixed};
 
 /// Convert one non-NULL ODPI-C value of a fixed-width kind and store it at `row`.
 pub fn storeFixed(plan: *const ColumnPlan, value: *const c.dpiDataBuffer, data: [*]u8, row: usize) FixedError!void {
@@ -385,6 +478,11 @@ pub fn storeFixed(plan: *const ColumnPlan, value: *const c.dpiDataBuffer, data: 
         .double => @as([*]f64, @ptrCast(@alignCast(data)))[row] = value.asDouble,
         .float => @as([*]f32, @ptrCast(@alignCast(data)))[row] = value.asFloat,
         .boolean => @as([*]bool, @ptrCast(@alignCast(data)))[row] = value.asBoolean != 0,
+        .number_double => {
+            const b = value.asBytes;
+            const text: []const u8 = if (b.length == 0) "" else b.ptr[0..b.length];
+            @as([*]f64, @ptrCast(@alignCast(data)))[row] = try parseNumberAsDouble(text);
+        },
         .timestamp => @as([*]i64, @ptrCast(@alignCast(data)))[row] = timestampMicros(&value.asTimestamp),
         .timestamptz => @as([*]i64, @ptrCast(@alignCast(data)))[row] = timestampTzMicros(&value.asTimestamp),
         .interval => @as([*]c.duckdb_interval, @ptrCast(@alignCast(data)))[row] =
@@ -634,10 +732,10 @@ test "NUMBER mapping" {
     // negative scale -> integer with p-s digits
     try testing.expectEqual(DuckKind.bigint, (try planOf(N, 5, -2)).kind);
     try testing.expectEqual(DuckKind.decimal, (try planOf(N, 30, -5)).kind);
-    try testing.expectEqual(DuckKind.double, (try planOf(N, 38, -5)).kind);
-    // unconstrained NUMBER and FLOAT(b) -> DOUBLE
-    try testing.expectEqual(DuckKind.double, (try planOf(N, 0, -127)).kind);
-    try testing.expectEqual(DuckKind.double, (try planOf(N, 126, -127)).kind);
+    try testing.expectEqual(DuckKind.number_double, (try planOf(N, 38, -5)).kind);
+    // unconstrained NUMBER and FLOAT(b) -> DOUBLE (checked: see "unconstrained NUMBER follows the number mode")
+    try testing.expectEqual(DuckKind.number_double, (try planOf(N, 0, -127)).kind);
+    try testing.expectEqual(DuckKind.number_double, (try planOf(N, 126, -127)).kind);
 }
 
 test "other type mappings" {
@@ -774,7 +872,8 @@ test "numeric and boolean natives via dpiData" {
 
     var of64: [1]f64 = .{0};
     d.value.asDouble = 3.25;
-    try storeFixed(&(try planOf(c.DPI_ORACLE_TYPE_NUMBER, 0, -127)), &d.value, @ptrCast(&of64), 0);
+    // the lossy_double fast path takes OCI's own double conversion
+    try storeFixed(&(try planWith(c.DPI_ORACLE_TYPE_NUMBER, 0, -127, .lossy_double)), &d.value, @ptrCast(&of64), 0);
     try testing.expectEqual(@as(f64, 3.25), of64[0]);
 
     var of32: [1]f32 = .{0};
@@ -1015,4 +1114,104 @@ test "VECTOR conversion from hand-built dpiVectorInfo" {
     // empty vector
     vi = vecInfo(c.DPI_VECTOR_FORMAT_FLOAT32, 0, 4, null);
     try testing.expectEqual(@as(usize, 0), try vectorLen(&vi, .float));
+}
+
+// --- NUMBER that has no exact DECIMAL form (review F1) ------------------------
+// Expected values: Python `int(float(n)) == n` for each literal.
+
+test "parseNumberAsDouble: integers a double holds exactly" {
+    try testing.expectEqual(@as(f64, 9007199254740992.0), try parseNumberAsDouble("9007199254740992")); // 2^53
+    try testing.expectEqual(@as(f64, 9007199254740994.0), try parseNumberAsDouble("9007199254740994")); // even above 2^53
+    try testing.expectEqual(@as(f64, 1e22), try parseNumberAsDouble("10000000000000000000000"));
+    try testing.expectEqual(@as(f64, 1152921504606846976.0), try parseNumberAsDouble("1152921504606846976")); // 2^60
+    try testing.expectEqual(@as(f64, -42.0), try parseNumberAsDouble("-42"));
+    try testing.expectEqual(@as(f64, 0.0), try parseNumberAsDouble("0"));
+}
+
+test "parseNumberAsDouble: integers a double cannot hold are an error, not rounded" {
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("9007199254740993")); // 2^53 + 1
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("-9007199254740993"));
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("12345678901234567890"));
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("123456789012345678"));
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("1152921504606846977")); // 2^60 + 1
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("99999999999999999999999999999999999999")); // 38 nines
+}
+
+test "parseNumberAsDouble: fractions and huge magnitudes are accepted" {
+    try testing.expectEqual(@as(f64, 123.456), try parseNumberAsDouble("123.456"));
+    try testing.expectEqual(@as(f64, -0.5), try parseNumberAsDouble("-.5"));
+    try testing.expectEqual(@as(f64, 0.5), try parseNumberAsDouble(".5"));
+    // 1/3 as Oracle prints it (40 digits): approximate by nature, must not be rejected
+    try testing.expectEqual(@as(f64, 0.3333333333333333), try parseNumberAsDouble("0.3333333333333333333333333333333333333333"));
+    // 1 followed by 100 zeros: more than 38 digits is a floating-point magnitude
+    const big = "1" ++ "0" ** 100;
+    try testing.expectEqual(@as(f64, 1e100), try parseNumberAsDouble(big));
+    // an integral value written with a fractional zero part is still integral
+    try testing.expectError(error.PrecisionLoss, parseNumberAsDouble("9007199254740993.0"));
+}
+
+test "parseNumberAsDouble: malformed text" {
+    try testing.expectError(error.InvalidNumber, parseNumberAsDouble(""));
+    try testing.expectError(error.InvalidNumber, parseNumberAsDouble("-"));
+    try testing.expectError(error.InvalidNumber, parseNumberAsDouble("1e5"));
+    try testing.expectError(error.InvalidNumber, parseNumberAsDouble("1.2.3"));
+    try testing.expectError(error.InvalidNumber, parseNumberAsDouble("12a"));
+}
+
+test "NumberMode.parse" {
+    try testing.expectEqual(NumberMode.double, NumberMode.parse("double").?);
+    try testing.expectEqual(NumberMode.lossy_double, NumberMode.parse("LOSSY_DOUBLE").?);
+    try testing.expectEqual(NumberMode.varchar, NumberMode.parse("Varchar").?);
+    try testing.expect(NumberMode.parse("decimal") == null);
+}
+
+fn planWith(ot: c.dpiOracleTypeNum, p: i16, s: i8, mode: NumberMode) !ColumnPlan {
+    const ti = typeInfo(ot, p, s);
+    return planColumnOpts(&ti, .{ .number = mode });
+}
+
+test "unconstrained NUMBER follows the number mode; exact types never do" {
+    const N = c.DPI_ORACLE_TYPE_NUMBER;
+    // default: checked double, fetched as text
+    const d = try planWith(N, 0, -127, .double);
+    try testing.expectEqual(DuckKind.number_double, d.kind);
+    try testing.expectEqual(@as(c.dpiNativeTypeNum, c.DPI_NATIVE_TYPE_BYTES), d.native_type);
+    try testing.expectEqual(@as(c.duckdb_type, c.DUCKDB_TYPE_DOUBLE), d.kind.duckdbType());
+    // lossy: the old fast path
+    const l = try planWith(N, 0, -127, .lossy_double);
+    try testing.expectEqual(DuckKind.double, l.kind);
+    try testing.expectEqual(@as(c.dpiNativeTypeNum, c.DPI_NATIVE_TYPE_DOUBLE), l.native_type);
+    // varchar: exact text
+    const v = try planWith(N, 0, -127, .varchar);
+    try testing.expectEqual(DuckKind.varchar, v.kind);
+    try testing.expectEqual(@as(c.dpiNativeTypeNum, c.DPI_NATIVE_TYPE_BYTES), v.native_type);
+    try testing.expectEqual(@as(c.dpiOracleTypeNum, N), v.oracle_type);
+    // FLOAT(b) and NUMBER wider than DECIMAL(38) take the same path
+    try testing.expectEqual(DuckKind.number_double, (try planWith(N, 126, -127, .double)).kind);
+    try testing.expectEqual(DuckKind.number_double, (try planWith(N, 38, -5, .double)).kind);
+    try testing.expectEqual(DuckKind.varchar, (try planWith(N, 50, 10, .varchar)).kind);
+    // exact types are unaffected by the mode
+    try testing.expectEqual(DuckKind.bigint, (try planWith(N, 10, 0, .varchar)).kind);
+    try testing.expectEqual(DuckKind.decimal, (try planWith(N, 10, 2, .varchar)).kind);
+    try testing.expectEqual(DuckKind.double, (try planWith(c.DPI_ORACLE_TYPE_NATIVE_DOUBLE, 0, 0, .varchar)).kind);
+}
+
+test "number_double column stores doubles and rejects lossy integers" {
+    var plan = try planWith(c.DPI_ORACLE_TYPE_NUMBER, 0, -127, .double);
+    var d = std.mem.zeroes(c.dpiData);
+    var text = "123.5".*;
+    d.value.asBytes = .{ .ptr = &text, .length = text.len, .encoding = null };
+    var out: [2]f64 = .{ 0, 0 };
+    try storeFixed(&plan, &d.value, @ptrCast(&out), 1);
+    try testing.expectEqual(@as(f64, 123.5), out[1]);
+
+    var big = "9007199254740993".*;
+    d.value.asBytes = .{ .ptr = &big, .length = big.len, .encoding = null };
+    try testing.expectError(error.PrecisionLoss, storeFixed(&plan, &d.value, @ptrCast(&out), 0));
+    try testing.expectEqual(@as(f64, 0), out[0]); // nothing was written
+}
+
+test "varchar-mode number needs the full NUMBER text buffer in the batch budget" {
+    const plan = try planWith(c.DPI_ORACLE_TYPE_NUMBER, 0, -127, .varchar);
+    try testing.expect(rowBufferBytes(&plan) >= 172);
 }

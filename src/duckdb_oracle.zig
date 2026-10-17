@@ -93,6 +93,8 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     // password given in SQL leaks. The password is read from an environment
     // variable; `password_env` only chooses which one.
     duck("duckdb_table_function_add_named_parameter")(tf, "password_env", vt);
+    // 'double' (default, checked) | 'lossy_double' | 'varchar': see convert.NumberMode
+    duck("duckdb_table_function_add_named_parameter")(tf, "unconstrained_number", vt);
 
     // Seconds; 0 disables. See timeouts.zig for why these exist.
     var vi = logicalType(c.DUCKDB_TYPE_BIGINT);
@@ -204,6 +206,8 @@ const QueryBind = struct {
     conn: ?*c.dpiConn = null,
     sql: []u8 = &.{},
     plans: []convert.ColumnPlan = &.{},
+    /// Oracle column names, for error messages
+    names: [][]u8 = &.{},
     vector_size: u32,
     /// rows per ODPI-C array fetch (== vector_size unless rows are very wide)
     fetch_rows: u32 = 0,
@@ -212,6 +216,8 @@ const QueryBind = struct {
         if (self.conn) |conn| _ = c.dpiConn_release(conn);
         alloc.free(self.sql);
         alloc.free(self.plans);
+        for (self.names) |n| alloc.free(n);
+        alloc.free(self.names);
         alloc.destroy(self);
     }
 };
@@ -266,6 +272,19 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     if (password == null or password.?.len == 0) {
         msg.set("duckdb_oracle: oracle_query: no password given: the environment variable {s} is empty or not set (passwords are never accepted as SQL arguments; password_env := 'NAME' selects another variable)", .{pw_var});
         return error.Bind;
+    }
+
+    var number_mode: convert.NumberMode = .double;
+    if (hasNamedParam(info, "unconstrained_number")) {
+        const given = namedParam(info, "unconstrained_number") orelse {
+            msg.set("duckdb_oracle: oracle_query: unconstrained_number must not be NULL", .{});
+            return error.Bind;
+        };
+        defer alloc.free(given);
+        number_mode = convert.NumberMode.parse(given) orelse {
+            msg.set("duckdb_oracle: oracle_query: unconstrained_number must be 'double', 'lossy_double' or 'varchar', got '{s}'", .{given});
+            return error.Bind;
+        };
     }
 
     const connect_secs = try secondsParam(info, msg, "connect_timeout", timeouts.default_connect_secs);
@@ -343,6 +362,8 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     }
 
     bind.plans = try alloc.alloc(convert.ColumnPlan, ncols);
+    bind.names = try alloc.alloc([]u8, ncols);
+    @memset(bind.names, &.{}); // destroy() frees every entry, also after a partial failure
     var col: u32 = 0;
     while (col < ncols) : (col += 1) {
         var qi = std.mem.zeroes(c.dpiQueryInfo);
@@ -351,11 +372,12 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
             return error.Bind;
         }
         const name: []const u8 = if (qi.name) |n| n[0..qi.nameLength] else "";
-        const plan = convert.planColumn(&qi.typeInfo) catch {
+        const plan = convert.planColumnOpts(&qi.typeInfo, .{ .number = number_mode }) catch {
             msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, convert.oracleTypeName(qi.typeInfo.oracleTypeNum) });
             return error.Bind;
         };
         bind.plans[col] = plan;
+        bind.names[col] = try alloc.dupe(u8, name);
 
         var lt = planLogicalType(&plan);
         defer duck("duckdb_destroy_logical_type")(&lt);
@@ -579,7 +601,14 @@ fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, 
                     }
                 },
                 else => convert.storeFixed(plan, &d.value, out, r) catch |e| {
-                    msg.set("duckdb_oracle: column {d}: cannot convert value ({s})", .{ col + 1, @errorName(e) });
+                    if (e == error.PrecisionLoss) {
+                        const b = d.value.asBytes;
+                        const shown: []const u8 = if (b.ptr == null) "" else b.ptr[0..@min(b.length, 64)];
+                        msg.set("duckdb_oracle: column {d} (\"{s}\"): NUMBER value {s} cannot be represented exactly as DOUBLE (it would be silently rounded). " ++
+                            "Use CAST(... AS NUMBER(38)) in the Oracle query, or pass unconstrained_number := 'varchar' (exact text) or 'lossy_double' (accept rounding)", .{ col + 1, bind.names[col], shown });
+                    } else {
+                        msg.set("duckdb_oracle: column {d}: cannot convert value ({s})", .{ col + 1, @errorName(e) });
+                    }
                     return error.Fetch;
                 },
             }

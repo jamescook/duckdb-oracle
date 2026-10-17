@@ -57,6 +57,23 @@ SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', connect_tim
 ----
 connect_timeout must be between 0 and
 
+# How NUMBERs without an exact DECIMAL form are materialised
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', unconstrained_number := 'decimal');
+----
+unconstrained_number must be 'double', 'lossy_double' or 'varchar'
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', unconstrained_number := NULL);
+----
+unconstrained_number must not be NULL
+
+# valid values reach the connect step (and fail there, as no server exists)
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', unconstrained_number := 'VARCHAR');
+----
+<REGEX>:.*duckdb_oracle: .*(DPI-1047|ORA-125[0-9][0-9]).*
+
 # Unknown named parameters are rejected by DuckDB's binder
 statement error
 SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', schema := 'x');
