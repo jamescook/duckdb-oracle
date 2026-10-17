@@ -44,6 +44,8 @@ FAKE_CLI = textwrap.dedent('''\
         base = os.path.basename(path)
         if mode == "load_fails":
             out("IO Error: could not load"); sys.exit(1)
+        if base != "duckdb_oracle.duckdb_extension" and mode in ("misnamed_exit0", "misnamed_crash"):
+            out('IO Error: File "%s" did not contain function "%s_init_c_api"' % (base, base.rsplit(".", 1)[0])); sys.exit(0 if mode == "misnamed_exit0" else 139)
         if base != "duckdb_oracle.duckdb_extension" and mode == "misnamed_other_error":
             out("IO Error: some unrelated failure"); sys.exit(1)
         if base != "duckdb_oracle.duckdb_extension" and mode != "misnamed_loads":
@@ -215,6 +217,12 @@ class LoadTests(Tmp):
     def test_negative_control_passes_when_a_misnamed_copy_is_rejected(self):
         self.assertTrue(va.check_negative_control(self.fake_cli("ok"), self.ext(), "linux_amd64").ok)
 
+    def test_negative_control_accepts_exit_0_from_old_clis_when_the_symbol_error_is_shown(self):
+        self.assertTrue(va.check_negative_control(self.fake_cli("misnamed_exit0"), self.ext(), "linux_amd64").ok)
+
+    def test_negative_control_fails_when_the_cli_crashes_while_loading_the_copy(self):
+        self.assertFalse(va.check_negative_control(self.fake_cli("misnamed_crash"), self.ext(), "linux_amd64").ok)
+
     def test_negative_control_fails_if_a_misnamed_copy_would_load(self):
         self.assertFalse(va.check_negative_control(self.fake_cli("misnamed_loads"), self.ext(), "linux_amd64").ok)
 
@@ -236,8 +244,10 @@ class ClientTests(Tmp):
     def test_a_query_that_unexpectedly_succeeds_fails(self):
         self.assertEqual(len(failed(va.check_client(self.fake_cli("no_error"), self.ext(), None))), 1)
 
-    def test_an_oracle_error_with_exit_code_0_fails(self):
-        self.assertEqual(len(failed(va.check_client(self.fake_cli("error_exit0"), self.ext(), None))), 1)
+    def test_old_cli_releases_exit_0_on_errors_so_the_error_text_decides(self):
+        # DuckDB 1.2.x CLIs exit 0 after a failed statement; the message is what matters
+        res = va.check_client(self.fake_cli("error_exit0"), self.ext(), None)
+        self.assertEqual(failed(res), [], [str(x) for x in res])
 
     def test_a_crash_exit_code_fails_even_with_an_oracle_error_text(self):
         # exit 139 = SIGSEGV: "never crash the process"

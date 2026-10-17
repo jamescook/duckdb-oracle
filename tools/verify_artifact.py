@@ -205,6 +205,12 @@ class Cli:
             return 124, f"timed out after {self.timeout}s (a hang)"
 
 
+def clean_exit(rc):
+    """A statement error is reported with exit 1 by current CLIs and exit 0 by DuckDB
+    1.2.x; anything else (a signal, 124 = hang) means the process did not end cleanly."""
+    return rc in (0, 1)
+
+
 def check_load(cli, ext_path):
     out = []
     rc, text = cli.run("SELECT version() AS version, source_id FROM pragma_version();", unsigned=False)
@@ -234,7 +240,8 @@ def check_negative_control(cli, ext_path, platform):
         shutil.copyfile(ext_path, bad)
         rc, text = cli.run(f"LOAD '{cli.ext_arg(bad)}';")
     want = f"{EXTENSION_NAME}-{platform}_init_c_api"
-    return Finding("negative control: a platform-suffixed copy must fail to load", rc != 0 and want in text,
+    # The error text is the evidence: DuckDB 1.2.x CLIs exit 0 after a failed statement.
+    return Finding("negative control: a platform-suffixed copy must fail to load", clean_exit(rc) and want in text,
                    f"exit {rc}, expected '{want}' in: {text.strip()[:300]}")
 
 
@@ -252,8 +259,8 @@ def check_client(cli, ext_path, client_dir):
     creds = {"ORACLE_USER": "scott", "ORACLE_PASSWORD": PROBE_PASSWORD}
     rc, text = cli.run(f"LOAD '{ext}'; SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'SELECT * FROM dual');",
                        extra_env={**extra, **creds}, drop_env=env_drop)
-    out.append(Finding(f"[{label}] an unreachable DSN is a clean ORA-/DPI- error (exit 1, no crash)",
-                       rc == 1 and re.search(r"(ORA|DPI)-\d+", text) is not None, f"exit {rc}: {text.strip()[:300]}"))
+    out.append(Finding(f"[{label}] an unreachable DSN is a clean ORA-/DPI- error (no crash, no hang)",
+                       clean_exit(rc) and re.search(r"(ORA|DPI)-\d+", text) is not None, f"exit {rc}: {text.strip()[:300]}"))
     out.append(Finding(f"[{label}] the error does not echo the password", PROBE_PASSWORD not in text))
     return out
 
