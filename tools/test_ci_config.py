@@ -59,7 +59,7 @@ class WorkflowContract(unittest.TestCase):
         self.assertEqual(found, ["ci.yml", "e2e-oracle19c.yml", "windows.yml", "zig-0.15.yml"])
 
     def test_ci_is_automatic_and_the_others_are_manual(self):
-        self.assertEqual(triggers(self.wf("ci.yml")), {"push", "pull_request"})
+        self.assertEqual(triggers(self.wf("ci.yml")), {"push", "pull_request", "workflow_dispatch"})
         for name in ("zig-0.15.yml", "windows.yml", "e2e-oracle19c.yml"):
             self.assertEqual(triggers(self.wf(name)), {"workflow_dispatch"}, name)
 

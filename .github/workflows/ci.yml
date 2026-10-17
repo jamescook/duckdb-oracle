@@ -1,11 +1,12 @@
 name: CI
 
-# Automatic. Zig 0.17 only; the 0.15.2 compatibility check is the manual zig-0.15.yml.
+# Automatic on pull requests and non-main pushes, or by hand. Zig 0.17 only; the 0.15.2 compatibility check is the manual zig-0.15.yml.
 on:
   push:
     # Not run automatically on main for now. Remove this filter to bring the push trigger back.
     branches-ignore: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
