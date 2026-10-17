@@ -51,7 +51,7 @@ python3 -m unittest discover -s tools     # the verifier's own tests (it must FA
 ```
 
 Options: `-Doptimize=Debug|ReleaseSafe|ReleaseFast`, `-Dextension-version=v0.1.0`
-(the default comes from `git describe`), `-Dduckdb-version=vX.Y.Z` (see below; `-Dcapi-version`
+(the default comes from `git describe`, so an untagged build reports a commit hash such as `042dc85`; build releases from a tag), `-Dduckdb-version=vX.Y.Z` (see below; `-Dcapi-version`
 is a deprecated alias), and `-Dpython=python3`.
 
 ## Distribution: one zip per platform

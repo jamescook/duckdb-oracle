@@ -2,9 +2,6 @@ name: duckdb-oracle CI
 
 on:
   push:
-    # Not run automatically on main for now. Start it by hand with
-    # workflow_dispatch; remove this filter to bring the push trigger back.
-    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
 
@@ -208,3 +205,77 @@ jobs:
       - name: test-windows.ps1 -SkipOracle
         shell: pwsh
         run: .\test-windows.ps1 -DuckDB .\duckdb-cli\duckdb.exe -DuckDBVersion $env:DUCKDB_BASELINE -Extension "zig-out\dist\duckdb_oracle-windows_amd64.zip" -SkipOracle -TimeoutSeconds 60
+
+  # The only job that runs the describe -> fetch -> convert path against a real
+  # Oracle server (the offline tests cannot reach it). Oracle Free 23ai in a
+  # service container; the account is the image's SYSTEM user.
+  # NOT YET RUN ON GITHUB: tools/live_oracle_test.py was written without access
+  # to an Oracle server, so its first run may expose a wrong expectation in the
+  # script as easily as a bug in the extension.
+  live-oracle:
+    name: Live Oracle (Oracle Free 23ai service container)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          ORACLE_PASSWORD: ci-only-password
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh --health-interval 10s --health-timeout 5s --health-retries 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: duckdb-oracle-extensions-zig-0.15.2
+          path: artifacts
+      - name: Install Oracle Instant Client (latest, 23ai generation) and the DuckDB wheel
+        run: |
+          sudo apt-get install -y -q libaio1t64 || sudo apt-get install -y -q libaio1
+          curl -fsSL -o ic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
+          unzip -qo ic.zip -d ic
+          for d in ic/instantclient_*; do [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 "$d/libaio.so.1"; done
+          python3 -m venv .venv
+          .venv/bin/pip install -q "duckdb==${DUCKDB_BASELINE#v}"
+      - name: Live type, LIMIT, LOB, error, guard and timeout tests
+        env:
+          ORACLE_DSN: localhost:1521/FREEPDB1
+          ORACLE_USER: system
+          ORACLE_PASSWORD: ci-only-password
+        run: |
+          export LD_LIBRARY_PATH=$(ls -d $PWD/ic/instantclient_* | tail -1)
+          export DUCKDB_ORACLE_EXTENSION=$(python3 tools/verify_artifact.py extract "$PWD/artifacts/dist/duckdb_oracle-linux_amd64.zip")
+          .venv/bin/python tools/live_oracle_test.py
+
+  # The Windows client locator against the official Windows duckdb.exe and Oracle's
+  # real Windows oci.dll, under Wine (a stand-in for Windows; the same scenarios
+  # should also be run on a real Windows host). NOT YET RUN ON GITHUB.
+  windows-locator-wine:
+    name: Windows client locator under Wine
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: duckdb-oracle-extensions-zig-0.15.2
+          path: artifacts
+      - name: Install Wine, the official Windows CLI and the Windows Instant Client
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update -q
+          sudo apt-get install -y -q wine64 libwine fonts-wine unzip
+          curl -fsSL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/$DUCKDB_BASELINE/duckdb_cli-windows-amd64.zip
+          unzip -o duckdb.zip -d duckdb-win
+          curl -fsSL -o ic-win.zip https://download.oracle.com/otn_software/nt/instantclient/instantclient-basic-windows.zip
+          unzip -qo ic-win.zip -d ic-win
+      - name: Verify the Windows artifact under Wine, then run the locator scenarios
+        run: |
+          ic=$(ls -d $PWD/ic-win/instantclient_* | tail -1)
+          python3 tools/verify_artifact.py check artifacts/dist/duckdb_oracle-windows_amd64.zip --platform windows_amd64 --capi-version $TARGET_CAPI \
+            --duckdb $PWD/duckdb-win/duckdb.exe --wine /usr/lib/wine/wine64 --client none --client $ic
+          tools/windows-locator-test.sh $PWD/duckdb-win/duckdb.exe artifacts/dist/duckdb_oracle-windows_amd64.zip $ic /usr/lib/wine/wine64

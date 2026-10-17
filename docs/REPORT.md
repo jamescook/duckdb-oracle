@@ -1,5 +1,14 @@
 # duckdb-oracle: verification report
 
+> **Note added after an independent review (see the git log).** This report records the verification of v0.6.1 and is kept as
+> history; it is not updated. Behaviour described below that has since changed: `oracle_query(..., password := ...)` was removed
+> in favour of `password_env`/`ORACLE_PASSWORD` (section 3.2, "Credentials"); unconstrained `NUMBER` is still `DOUBLE` but integers a
+> double cannot hold exactly are now an error (type mapping; `unconstrained_number`); connect and call timeouts exist (`connect_timeout`,
+> `timeout`); on Windows the extension now chooses `oci.dll` itself and never searches the current directory; the shell load tests were
+> replaced by `tools/verify_artifact.py`. The README is authoritative for current behaviour. `evidence.txt` and
+> `evidence-history.txt` named below were never committed to this repository.
+
+
 Run date: 2026-10-17. Sandbox: Ubuntu 24.04 x86_64, no Oracle server, no Docker.
 **Updates:**
 * v0.2.0 added support for Oracle 23ai/26ai (section 6).
