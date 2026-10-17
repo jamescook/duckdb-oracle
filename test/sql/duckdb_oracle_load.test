@@ -20,3 +20,5 @@ SELECT function_name FROM duckdb_functions() WHERE function_name LIKE 'oracle_%'
 ----
 oracle_client_info
 oracle_query
+oracle_scan
+oracle_tables

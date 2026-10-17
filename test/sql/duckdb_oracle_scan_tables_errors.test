@@ -1,0 +1,118 @@
+# name: test/sql/duckdb_oracle_scan_tables_errors.test
+# description: oracle_scan, oracle_tables and the shared geometry / current_schema options: argument validation (no server needed)
+# group: [duckdb_oracle]
+#
+# Every statement here fails before a connection is made (the name, the options and the SQL are checked first),
+# so no Oracle server is needed. The harness exports ORACLE_USER=u and ORACLE_PASSWORD=slt-secret-pw-7f3a.
+
+require duckdb_oracle
+
+# --- oracle_scan: the name ------------------------------------------------------------------------
+statement error
+SELECT * FROM oracle_scan(NULL, 't');
+----
+dsn must not be NULL
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', NULL);
+----
+name must not be NULL
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', '');
+----
+the name is empty
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 'a.b.c');
+----
+at most two parts
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 'people@some_link');
+----
+database links (name@link) are not supported
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', '"unclosed');
+----
+a quoted identifier must be
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 'drop table x; --');
+----
+unexpected character
+
+# --- no password argument, on any function --------------------------------------------------------
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', password := 'p');
+----
+Invalid named parameter "password"
+
+statement error
+SELECT * FROM oracle_tables('127.0.0.1:1/NOPE', password := 'p');
+----
+Invalid named parameter "password"
+
+# --- options shared by all three functions ----------------------------------------------------------
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', geometry := 'geojson');
+----
+geometry must be 'wkb' or 'wkt'
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', geometry := NULL);
+----
+geometry must not be NULL
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', geometry_srid := NULL);
+----
+geometry_srid must not be NULL
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', current_schema := 'a.b');
+----
+current_schema must be a single schema name
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', current_schema := 'bad name');
+----
+current_schema 'bad name' is not a valid schema name
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', current_schema := '');
+----
+the name is empty
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', timeout := -1);
+----
+oracle_scan: timeout must be between 0 and
+
+statement error
+SELECT * FROM oracle_scan('127.0.0.1:1/NOPE', 't', auth := 'kerberos');
+----
+oracle_scan: auth must be 'password' or 'external'
+
+# --- oracle_tables ----------------------------------------------------------------------------------
+statement error
+SELECT * FROM oracle_tables(NULL);
+----
+dsn must not be NULL
+
+statement error
+SELECT * FROM oracle_tables('127.0.0.1:1/NOPE', schema := 'a.b');
+----
+schema must be a single schema name
+
+statement error
+SELECT * FROM oracle_tables('127.0.0.1:1/NOPE', schema := '"');
+----
+is not a valid schema name
+
+# A valid call gets as far as the connection: the listener on port 1 does not exist, and the failure is Oracle's or the client library's
+statement error
+SELECT * FROM oracle_tables('127.0.0.1:1/NOPE');
+----
+duckdb_oracle:
