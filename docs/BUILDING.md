@@ -213,6 +213,7 @@ third_party/                 vendored DuckDB headers, ODPI-C, metadata script (s
 .github/actions/build-test   the build-and-test steps shared by ci.yml and zig-0.15.yml
 docs/SELF_HOSTED_RUNNER.md   registering the runner for e2e-oracle19c.yml
 docs/dev/REPORT.md           development log of the original verification (history, not user documentation)
+docs/dev/WRITES.md           assessment: writing to Oracle through the stable C API (no clean path at the supported floor)
 ```
 
 ## Licenses

@@ -182,4 +182,7 @@ Table function that returns one row and never fails. It is the first thing to ru
   interrupts ignored). `connect_timeout` (default 30 s) and `timeout` (default 600 s per round trip) now bound that.
   The call timeout has not been exercised against a live server.
 * Bind does not expose Oracle bind variables. Build the SQL text yourself, taking care with quoting.
-* No catalog integration (`ATTACH`), no writes, and no DuckDB secrets. See [ROADMAP.md](ROADMAP.md).
+* No catalog integration (`ATTACH`), no writes (why: [dev/WRITES.md](dev/WRITES.md)), and no DuckDB secrets. See [ROADMAP.md](ROADMAP.md).
+* Geometry: `SDO_GEOMETRY` columns arrive as WKB `BLOB` (or WKT `VARCHAR`), not as DuckDB's `GEOMETRY` type, and the SRID is dropped unless `geometry_srid := true` ([TYPES.md](TYPES.md#spatial-data-sdo_geometry)). Other Oracle object types are unsupported.
+* `oracle_scan` and `oracle_tables` read the Oracle dictionary views `ALL_OBJECTS` / `ALL_SYNONYMS`: they show what the user may see, a name cannot carry a database link, and `oracle_tables` lists one schema at a time.
+* Every Oracle call opens its own session, so `current_schema :=` affects only that call.
