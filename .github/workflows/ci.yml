@@ -41,11 +41,13 @@ jobs:
           - name: Oracle Free 23ai
             image: gvenzl/oracle-free:23-slim
             service: FREEPDB1
-            dirs: test/e2e test/e2e/spatial test/e2e/23ai
+            dirs: test/e2e test/e2e/spatial test/e2e/23ai test/e2e/needs-setup/23ai
+            setup: test/e2e/setup/23ai
           - name: Oracle XE 21c
             image: gvenzl/oracle-xe:21-slim
             service: XEPDB1
             dirs: test/e2e test/e2e/spatial
+            setup: ''
     services:
       oracle:
         image: ${{ matrix.image }}
@@ -74,6 +76,17 @@ jobs:
           ext=$(python3 tools/verify_artifact.py extract "$PWD/artifacts/duckdb_oracle-linux_amd64.zip" | tail -1)
           ic=$(tools/install-instantclient-linux.sh "$RUNNER_TEMP/ic")
           { echo "DUCKDB=$duckdb"; echo "EXTENSION=$ext"; echo "IC_DIR=$ic"; } >> "$GITHUB_ENV"
+      # Objects some tests need (VECTOR tables, ...): test/e2e/setup/*, run as SYSTEM on this throw-away container.
+      - name: Create the test objects (SQL*Plus as SYSTEM)
+        if: matrix.setup != ''
+        env:
+          E2E_SETUP_PASSWORD: ci-only-Oracle-1
+          E2E_SETUP: ${{ matrix.setup }}
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$IC_DIR" PATH="$IC_DIR:$PATH"
+          read -ra dirs <<< "$E2E_SETUP"
+          tools/e2e-setup.sh "localhost:1521/$SERVICE" "${dirs[@]}"
       - name: End-to-end tests
         env:
           ORACLE_USER: e2e_app

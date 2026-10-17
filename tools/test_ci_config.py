@@ -88,7 +88,11 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("test/e2e/spatial", free_dirs)
         self.assertIn("test/e2e/spatial", xe_dirs)
         self.assertIn("test/e2e/23ai", free_dirs, "VECTOR and BOOLEAN need 23ai")
+        self.assertIn("test/e2e/needs-setup/23ai", free_dirs, "the tests that need the setup scripts run after them")
         self.assertNotIn("test/e2e/23ai", xe_dirs, "XE 21c has no VECTOR or BOOLEAN")
+        self.assertNotIn("test/e2e/needs-setup/23ai", xe_dirs)
+        self.assertIn("test/e2e/setup/23ai", images["gvenzl/oracle-free:23-slim"]["setup"].split())
+        self.assertNotIn("test/e2e/setup/23ai", images["gvenzl/oracle-xe:21-slim"]["setup"].split())
         self.assertEqual(job["services"]["oracle"]["image"], "${{ matrix.image }}")
         self.assertIn("healthcheck.sh", job["services"]["oracle"]["options"])
         text = "\n".join(r for _, r in run_blocks({"jobs": {"e2e-oracle": job}}))
@@ -237,7 +241,8 @@ class PinsAndTests(unittest.TestCase):
             self.assertNotRegex(text, r"DUCKDB_BASELINE|DuckDBVersion\s*=\s*'v\d", path)
 
     def test_the_e2e_sql_follows_its_conventions(self):
-        files = sorted(glob.glob(os.path.join(REPO, "test", "e2e", "**", "*.sql"), recursive=True))
+        setup_dir = os.path.join(REPO, "test", "e2e", "setup") + os.sep
+        files = sorted(f for f in glob.glob(os.path.join(REPO, "test", "e2e", "**", "*.sql"), recursive=True) if not f.startswith(setup_dir))
         self.assertGreaterEqual(len(files), 12)
         for path in files:
             name = os.path.relpath(path, REPO)
@@ -262,6 +267,19 @@ class PinsAndTests(unittest.TestCase):
             # nothing may create or change Oracle objects (12_errors deliberately sends rejected statements)
             if "12_errors" not in name:
                 self.assertNotRegex(sql, r"'\s*(create|drop|alter|insert|update|delete|truncate|merge|grant)\s", name)
+
+    def test_the_e2e_setup_scripts_stop_on_error_and_only_touch_e2e_objects(self):
+        scripts = sorted(glob.glob(os.path.join(REPO, "test", "e2e", "setup", "*", "*.sql")))
+        self.assertGreaterEqual(len(scripts), 1)
+        for path in scripts:
+            name = os.path.relpath(path, REPO)
+            text = read(path)
+            self.assertRegex(text, r"(?im)^WHENEVER SQLERROR (EXIT FAILURE|CONTINUE)\s*$", f"{name}: say explicitly what an error does")
+            body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--"))
+            # these scripts run as SYSTEM: they may never touch anything that is not an E2E_ object
+            self.assertNotRegex(body, r"(?i)\b(alter\s+(system|database)|shutdown|startup)\b", name)
+            for m in re.finditer(r"(?i)\b(drop|create)\s+(?:or\s+replace\s+)?(?:public\s+)?(?:user|synonym|table|view)\s+(?:if\s+exists\s+)?([\w.\"$#]+)", body):
+                self.assertRegex(m.group(2).strip('"'), r"(?i)^(e2e_\w*|e2e_app\.e2e_\w*|e2e_\w+\.e2e_\w*|e2e_\w+\.\"?\w+\"?)$", f"{name}: {m.group(0)}")
 
     def test_the_documented_runner_label_and_env_keys_match_the_workflow(self):
         doc = read(REPO, "docs", "SELF_HOSTED_RUNNER.md")

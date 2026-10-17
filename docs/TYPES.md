@@ -31,6 +31,23 @@ these mappings, see [REFERENCE.md](REFERENCE.md#oracle_query).
 
 On a 19c server none of the 23ai rows can occur, so 19c behaviour does not depend on them.
 
+### VECTOR details
+
+The DuckDB type follows the **declared storage format of the column**, as Oracle describes it: `FLOAT32` gives `FLOAT[]` (a DuckDB
+`LIST(FLOAT)`), `FLOAT64` gives `DOUBLE[]`, `INT8` gives `FLOAT[]` (every int8 is exact as a float), `BINARY` gives `UTINYINT[]`.
+A column with a flexible format (`VECTOR(*, *)` or `VECTOR(n, *)`) is `DOUBLE[]`, and each value is converted from the format it
+happens to be stored in. The **number of dimensions** may be fixed or flexible (`VECTOR(*, FLOAT32)`): the list length is taken from
+each value, so rows of one column may have different lengths. A NULL vector is a NULL list.
+
+Limits: a `BINARY` value in a *flexible-format* column cannot be turned into a list of doubles and fails with `cannot convert VECTOR
+(VectorFormatMismatch)`; select such columns with a `BINARY`-declared type or convert them in the query. Sparse vectors need a 23.7+
+server and are densified (see the table). VECTOR values need the 23ai client libraries as well as the server.
+
+These mappings are covered by unit tests (hand-built `dpiVectorInfo` values) and by the end-to-end tests in `test/e2e/23ai/` and `test/e2e/needs-setup/23ai/`, which the
+hosted CI runs against Oracle Free 23ai: declared types and values for each format and for fixed and flexible dimensions, NULL rows,
+and 2500 rows with varying list lengths across a DuckDB vector boundary. `BINARY` vectors are tested in an optional test because the
+literal syntax used to create them in the setup script is the least certain part of it.
+
 ## Spatial data (SDO_GEOMETRY)
 
 A column of the Oracle object type `MDSYS.SDO_GEOMETRY` is found when the query is described, and Oracle itself converts it: no
