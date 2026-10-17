@@ -1,13 +1,14 @@
 # Reference
 
-Complete details for the two SQL functions, the environment variables the extension reads, the errors you may see, and the known
+Complete details for the four SQL functions, the environment variables the extension reads, the errors you may see, and the known
 limitations. For a quick introduction see the [README](../README.md). Column types are in [TYPES.md](TYPES.md).
 
 ## `oracle_query`
 
 ```sql
 oracle_query(dsn, sql [, user := ..., password_env := ..., auth := ..., unconstrained_number := ...,
-                         geometry := ..., geometry_srid := ..., connect_timeout := ..., timeout := ...])
+                         current_schema := ..., geometry := ..., geometry_srid := ...,
+                         connect_timeout := ..., timeout := ...])
 ```
 
 Table function. It runs one Oracle query and returns its result set.
@@ -20,6 +21,7 @@ Table function. It runs one Oracle query and returns its result set.
 | `auth := VARCHAR` | Optional. `'password'` (default) or `'external'`: Oracle wallet (`/@alias`), Kerberos or OS authentication, where no user or password is given. `user` and `password_env` are refused in external mode |
 | `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
 | `unconstrained_number := VARCHAR` | Optional. How a `NUMBER` with no exact `DECIMAL` form is returned (see [TYPES.md](TYPES.md#unconstrained-number)): `'double'` (default, checked), `'lossy_double'` or `'varchar'` |
+| `current_schema := VARCHAR` | Optional. Runs `ALTER SESSION SET CURRENT_SCHEMA` on this connection before the query, so unqualified names resolve in that schema (no privileges are needed and nothing else changes: the session user is the same). An unquoted name is folded to upper case, `'"MixedCase"'` is taken exactly; `NULL` means "leave it". It affects only this call's own connection |
 | `geometry := VARCHAR` | Optional. What `MDSYS.SDO_GEOMETRY` columns become (see [TYPES.md](TYPES.md#spatial-data-sdo_geometry)): `'wkb'` (default, `BLOB`) or `'wkt'` (`VARCHAR`) |
 | `geometry_srid := BOOLEAN` | Optional, default `false`. `true` adds a `BIGINT` `<name>_srid` column after every geometry column (NULL for a NULL geometry or a geometry without SRID) |
 | `connect_timeout := BIGINT` | Optional. Seconds allowed for the connection handshake. Default **30**, `0` = no limit. Added to Easy Connect strings as `connect_timeout=N` unless the DSN already sets it; TNS aliases and `(DESCRIPTION=...)` strings are used unchanged (set it in `sqlnet.ora`/the descriptor) |
@@ -50,6 +52,64 @@ CREATE TABLE t AS SELECT * FROM oracle_query('localhost:1521/ORCLPDB1', 'SELECT 
 * Oracle errors become DuckDB errors that include the code, for example
   `Binder Error: duckdb_oracle: connect failed: ORA-12541: TNS:no listener` or
   `duckdb_oracle: Oracle client library could not be loaded: DPI-1047: ...`.
+
+## `oracle_scan`
+
+```sql
+oracle_scan(dsn, name [, user := ..., password_env := ..., auth := ..., unconstrained_number := ...,
+                         current_schema := ..., geometry := ..., geometry_srid := ...,
+                         connect_timeout := ..., timeout := ...])
+```
+
+Table function. Reads a whole table, view, materialized view or synonym by name; it is `oracle_query` with the `SELECT * FROM ...`
+written for you, and it takes the same named arguments with the same meaning (so `LIMIT`, types, geometry and timeouts work as
+described above and in [TYPES.md](TYPES.md)). There is no `password` argument here either: the password comes from the environment.
+
+`name` is `object` or `schema.object`, written the way Oracle reads a name: an unquoted part is folded to upper case, a part in double
+quotes is taken exactly (`'"MixedCase"'`, `'hr."Q1 results"'`), spaces around the dot are ignored. Database links (`name@link`) and
+more than two parts are refused; use `oracle_query` for those.
+
+A **qualified** name is exactly that schema's object. A **bare** name is looked up the way Oracle resolves it: a table, view,
+materialized view or private synonym in the **current schema** first, then a **public synonym**. The lookup is a query against
+`ALL_OBJECTS`, so it sees what this user may see; `current_schema :=` changes where bare names resolve. If nothing is found the
+error shows what was tried:
+
+```
+duckdb_oracle: oracle_scan: nothing named 'orders' is visible to this user. Tried: (1) "HR"."ORDERS" - a table, view,
+materialized view or private synonym in the current schema; (2) a public synonym "ORDERS". Unquoted names are folded to upper case; ...
+```
+
+```sql
+SELECT * FROM oracle_scan('localhost:1521/ORCLPDB1', 'sample.orders') LIMIT 10;
+SELECT * FROM oracle_scan('localhost:1521/ORCLPDB1', 'orders', current_schema := 'sample');
+SELECT * FROM oracle_scan('localhost:1521/ORCLPDB1', 'sample."Order Items"');
+```
+
+## `oracle_tables`
+
+```sql
+oracle_tables(dsn [, schema := ..., user := ..., password_env := ..., auth := ..., current_schema := ...,
+                     connect_timeout := ..., timeout := ...])
+```
+
+Table function. Lists the tables, views, materialized views and synonyms of **one schema**: the connection's current schema, or the
+schema named by `schema :=` (parsed like a name above: `'hr'` is `HR`, `'"hr"'` is `hr`; `schema := 'PUBLIC'` lists public
+synonyms). It reads `ALL_OBJECTS` and `ALL_SYNONYMS`, so it shows what this user can see, and leaves out recycle-bin objects
+(`BIN$...`).
+
+| Column | Meaning |
+|---|---|
+| `owner VARCHAR` | the schema |
+| `name VARCHAR` | the object name, exactly as Oracle stores it |
+| `type VARCHAR` | `TABLE`, `VIEW`, `MATERIALIZED VIEW` or `SYNONYM` |
+| `synonym_target VARCHAR` | for a synonym, `OWNER.NAME` of what it points to (`@LINK` appended for a database link); NULL otherwise |
+
+There is no cap on the number of rows (the list is one schema, ordered by name, and `LIMIT` stops the fetch early). Listing every
+schema at once is not supported: ask for the one you want, then use `oracle_scan`.
+
+```sql
+SELECT name, type, synonym_target FROM oracle_tables('localhost:1521/ORCLPDB1', schema := 'sample');
+```
 
 ## `oracle_client_info`
 
@@ -98,6 +158,9 @@ Table function that returns one row and never fails. It is the first thing to ru
 | `oracle_query only runs queries` | the statement was not a `SELECT` / `WITH` |
 | `NUMBER value ... cannot be represented exactly as DOUBLE` | see [Unconstrained NUMBER](TYPES.md#unconstrained-number) |
 | `has unsupported Oracle type` | see the last row of the [type table](TYPES.md) |
+| `oracle_scan: nothing named '...' is visible to this user` | the name resolved to no table, view or synonym; the message lists what was tried |
+| `oracle_scan: invalid name` / `current_schema '...' is not a valid schema name` | the name or schema could not be read as an Oracle identifier |
+| `ORA-01435` after `current_schema :=` | that schema does not exist |
 
 ## Known limitations
 

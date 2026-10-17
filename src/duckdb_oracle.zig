@@ -74,6 +74,14 @@ export fn duckdb_oracle_init_c_api(info: c.duckdb_extension_info, access: [*c]c.
         set_error(info, "duckdb_oracle: failed to register oracle_query");
         return false;
     }
+    if (!registerOracleScan(conn)) {
+        set_error(info, "duckdb_oracle: failed to register oracle_scan");
+        return false;
+    }
+    if (!registerOracleTables(conn)) {
+        set_error(info, "duckdb_oracle: failed to register oracle_tables");
+        return false;
+    }
     if (!registerClientInfo(conn)) {
         set_error(info, "duckdb_oracle: failed to register oracle_client_info");
         return false;
@@ -99,6 +107,8 @@ fn addCommonParams(tf: c.duckdb_table_function) void {
     duck("duckdb_table_function_add_named_parameter")(tf, "auth", vt);
     // 'double' (default, checked) | 'lossy_double' | 'varchar': see column.NumberMode
     duck("duckdb_table_function_add_named_parameter")(tf, "unconstrained_number", vt);
+    // ALTER SESSION SET CURRENT_SCHEMA for this connection (unquoted names fold to upper case)
+    duck("duckdb_table_function_add_named_parameter")(tf, "current_schema", vt);
     // 'wkb' (default, BLOB) | 'wkt' (VARCHAR): what SDO_GEOMETRY columns become
     duck("duckdb_table_function_add_named_parameter")(tf, "geometry", vt);
 
@@ -126,6 +136,41 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     addCommonParams(tf);
 
     duck("duckdb_table_function_set_bind")(tf, queryBind);
+    duck("duckdb_table_function_set_init")(tf, queryInit);
+    duck("duckdb_table_function_set_function")(tf, queryFunction);
+    return duck("duckdb_register_table_function")(conn, tf) == c.DuckDBSuccess;
+}
+
+fn registerOracleScan(conn: c.duckdb_connection) bool {
+    var tf = duck("duckdb_create_table_function")();
+    defer duck("duckdb_destroy_table_function")(&tf);
+    duck("duckdb_table_function_set_name")(tf, "oracle_scan");
+
+    var vt = logicalType(c.DUCKDB_TYPE_VARCHAR);
+    defer duck("duckdb_destroy_logical_type")(&vt);
+    duck("duckdb_table_function_add_parameter")(tf, vt); // dsn
+    duck("duckdb_table_function_add_parameter")(tf, vt); // [schema.]name of a table, view or synonym
+    addCommonParams(tf);
+
+    // the bind data, init and scan are the same as oracle_query's: only the SQL differs
+    duck("duckdb_table_function_set_bind")(tf, scanBind);
+    duck("duckdb_table_function_set_init")(tf, queryInit);
+    duck("duckdb_table_function_set_function")(tf, queryFunction);
+    return duck("duckdb_register_table_function")(conn, tf) == c.DuckDBSuccess;
+}
+
+fn registerOracleTables(conn: c.duckdb_connection) bool {
+    var tf = duck("duckdb_create_table_function")();
+    defer duck("duckdb_destroy_table_function")(&tf);
+    duck("duckdb_table_function_set_name")(tf, "oracle_tables");
+
+    var vt = logicalType(c.DUCKDB_TYPE_VARCHAR);
+    defer duck("duckdb_destroy_logical_type")(&vt);
+    duck("duckdb_table_function_add_parameter")(tf, vt); // dsn
+    duck("duckdb_table_function_add_named_parameter")(tf, "schema", vt);
+    addCommonParams(tf);
+
+    duck("duckdb_table_function_set_bind")(tf, tablesBind);
     duck("duckdb_table_function_set_init")(tf, queryInit);
     duck("duckdb_table_function_set_function")(tf, queryFunction);
     return duck("duckdb_register_table_function")(conn, tf) == c.DuckDBSuccess;
@@ -243,10 +288,13 @@ const Options = struct {
     call_secs: u32 = timeouts.default_call_secs,
     geometry: sqlgen.GeometryMode = .wkb,
     geometry_srid: bool = false,
+    /// `current_schema :=`, parsed (an unquoted name is folded to upper case)
+    current_schema: ?sqlgen.Name = null,
 
     fn deinit(self: *Options) void {
         if (self.user) |u| alloc.free(u);
         if (self.password_env) |v| alloc.free(v);
+        if (self.current_schema) |*n| n.deinit(alloc);
     }
 };
 
@@ -297,19 +345,41 @@ fn readOptions(info: c.duckdb_bind_info, msg: *Msg, comptime fname: []const u8) 
         }
         o.geometry_srid = duck("duckdb_get_bool")(v);
     }
+    // `current_schema := NULL` means "leave it as it is"
+    if (namedParam(info, "current_schema")) |given| {
+        defer alloc.free(given);
+        var parsed = sqlgen.parseName(alloc, given) catch |e| {
+            msg.set("duckdb_oracle: " ++ fname ++ ": current_schema '{s}' is not a valid schema name: {s}", .{ given, sqlgen.describeNameError(e) });
+            return error.Bind;
+        };
+        if (parsed.count != 1) {
+            parsed.deinit(alloc);
+            msg.set("duckdb_oracle: " ++ fname ++ ": current_schema must be a single schema name, got '{s}'", .{given});
+            return error.Bind;
+        }
+        o.current_schema = parsed;
+    }
+
     o.connect_secs = try secondsParam(info, msg, fname, "connect_timeout", timeouts.default_connect_secs);
     o.call_secs = try secondsParam(info, msg, fname, "timeout", timeouts.default_call_secs);
     return o;
 }
 
-/// Connect: credentials, client library, timeouts.
+/// Connect (credentials, client library, timeouts) and apply `current_schema`.
 fn openSession(dsn: []const u8, o: *const Options, msg: *Msg) !session_mod.Session {
-    return session_mod.Session.open(alloc, .{
+    const sess = try session_mod.Session.open(alloc, .{
         .dsn = dsn,
         .creds = .{ .user = o.user, .password_env = o.password_env, .auth = o.auth },
         .connect_secs = o.connect_secs,
         .call_secs = o.call_secs,
     }, msg);
+    if (o.current_schema) |schema| {
+        sess.setCurrentSchema(alloc, schema.object(), msg) catch |e| {
+            sess.close();
+            return e;
+        };
+    }
+    return sess;
 }
 
 fn queryBind(info: c.duckdb_bind_info) callconv(.c) void {
@@ -341,6 +411,117 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     defer opts.deinit();
     const sess = try openSession(dsn, &opts, msg);
     try bindSession(info, msg, sess, sql_prepared, &opts);
+}
+
+/// oracle_scan(dsn, name): the whole table, view or synonym `name`, resolved as Oracle would.
+fn scanBind(info: c.duckdb_bind_info) callconv(.c) void {
+    var msg: Msg = .{};
+    scanBindImpl(info, &msg) catch {
+        duck("duckdb_bind_set_error")(info, msg.z());
+    };
+}
+
+fn scanBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
+    const dsn = positionalParam(info, 0) orelse {
+        msg.set("duckdb_oracle: oracle_scan: dsn must not be NULL", .{});
+        return error.Bind;
+    };
+    defer alloc.free(dsn);
+    const raw_name = positionalParam(info, 1) orelse {
+        msg.set("duckdb_oracle: oracle_scan: name must not be NULL", .{});
+        return error.Bind;
+    };
+    defer alloc.free(raw_name);
+    var name = sqlgen.parseName(alloc, raw_name) catch |e| {
+        msg.set("duckdb_oracle: oracle_scan: invalid name '{s}': {s}", .{ raw_name, sqlgen.describeNameError(e) });
+        return error.Bind;
+    };
+    defer name.deinit(alloc);
+
+    var opts = try readOptions(info, msg, "oracle_scan");
+    defer opts.deinit();
+    const sess = try openSession(dsn, &opts, msg);
+    var sess_owned = true;
+    defer if (sess_owned) sess.close();
+
+    const sql = try resolveScanSql(sess, &name, raw_name, msg);
+    defer alloc.free(sql);
+    sess_owned = false; // bindSession closes it, whatever happens
+    try bindSession(info, msg, sess, sql, &opts);
+}
+
+/// Find what `name` refers to and return `SELECT * FROM <it>`; or explain what was tried.
+fn resolveScanSql(sess: session_mod.Session, name: *const sqlgen.Name, raw_name: []const u8, msg: *Msg) ![]u8 {
+    const q = try sqlgen.resolveQuery(alloc, name);
+    defer alloc.free(q);
+    const rows = try sess.queryStrings(alloc, q, 3, 8, msg);
+    defer {
+        session_mod.freeRows(alloc, rows);
+        alloc.free(rows);
+    }
+    if (rows.len == 0) {
+        var current: []const u8 = "(unknown)";
+        var cur_rows: ?[][][]u8 = null;
+        defer if (cur_rows) |r| {
+            session_mod.freeRows(alloc, r);
+            alloc.free(r);
+        };
+        if (name.schema() == null) {
+            var scratch: Msg = .{};
+            if (sess.queryStrings(alloc, sqlgen.current_schema_query, 1, 1, &scratch)) |r| {
+                cur_rows = r;
+                if (r.len == 1 and r[0][0].len > 0) current = r[0][0];
+            } else |_| {}
+        }
+        const text = try sqlgen.scanNotFoundMessage(alloc, raw_name, name, current);
+        defer alloc.free(text);
+        msg.set("{s}", .{text});
+        return error.Bind;
+    }
+    return sqlgen.scanSql(alloc, rows[0][0], rows[0][1], rows[0][2]) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        msg.set("duckdb_oracle: oracle_scan: '{s}'.'{s}' from the data dictionary cannot be written as a quoted identifier", .{ rows[0][0], rows[0][1] });
+        return error.Bind;
+    };
+}
+
+/// oracle_tables(dsn, schema := NULL): tables, views and synonyms of a schema.
+fn tablesBind(info: c.duckdb_bind_info) callconv(.c) void {
+    var msg: Msg = .{};
+    tablesBindImpl(info, &msg) catch {
+        duck("duckdb_bind_set_error")(info, msg.z());
+    };
+}
+
+fn tablesBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
+    const dsn = positionalParam(info, 0) orelse {
+        msg.set("duckdb_oracle: oracle_tables: dsn must not be NULL", .{});
+        return error.Bind;
+    };
+    defer alloc.free(dsn);
+    // `schema := NULL` is the default: the session's current schema
+    var schema: ?sqlgen.Name = null;
+    defer if (schema) |*n| n.deinit(alloc);
+    if (namedParam(info, "schema")) |given| {
+        defer alloc.free(given);
+        var parsed = sqlgen.parseName(alloc, given) catch |e| {
+            msg.set("duckdb_oracle: oracle_tables: schema '{s}' is not a valid schema name: {s}", .{ given, sqlgen.describeNameError(e) });
+            return error.Bind;
+        };
+        if (parsed.count != 1) {
+            parsed.deinit(alloc);
+            msg.set("duckdb_oracle: oracle_tables: schema must be a single schema name, got '{s}'", .{given});
+            return error.Bind;
+        }
+        schema = parsed;
+    }
+    const sql = try sqlgen.tablesQuery(alloc, if (schema) |*n| n.object() else null);
+    defer alloc.free(sql);
+
+    var opts = try readOptions(info, msg, "oracle_tables");
+    defer opts.deinit();
+    const sess = try openSession(dsn, &opts, msg);
+    try bindSession(info, msg, sess, sql, &opts);
 }
 
 /// Describe `sql_prepared` on `sess`, convert SDO_GEOMETRY columns, plan every column and publish

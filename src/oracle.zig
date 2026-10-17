@@ -30,7 +30,8 @@ const lib_dir_env = "DUCKDB_ORACLE_CLIENT_LIB_DIR";
 
 /// Fixed-size, NUL-terminated message buffer (no allocation on error paths).
 pub const Msg = struct {
-    buf: [2048]u8 = undefined,
+    /// zeroed, not undefined: a caller that reports an error whose text was never set sends "", not garbage
+    buf: [2048]u8 = std.mem.zeroes([2048]u8),
     len: usize = 0,
 
     pub fn set(self: *Msg, comptime fmt: []const u8, args: anytype) void {
@@ -195,4 +196,10 @@ pub fn clientInfo() ClientInfo {
     const h = archHint(&hint_buf, true);
     if (h.len > 0) info.message.set("OK ({s})", .{h}) else info.message.set("OK", .{});
     return info;
+}
+
+test "a fresh Msg is an empty, NUL-terminated string, never uninitialised memory" {
+    const m: Msg = .{};
+    try std.testing.expectEqual(@as(usize, 0), m.slice().len);
+    try std.testing.expectEqual(@as(u8, 0), m.z()[0]);
 }

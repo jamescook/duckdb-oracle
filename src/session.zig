@@ -15,6 +15,7 @@ const c = @import("c.zig").c;
 const compat = @import("compat.zig");
 const oracle = @import("oracle.zig");
 const timeouts = @import("timeouts.zig");
+const sqlgen = @import("sqlgen.zig");
 const Msg = oracle.Msg;
 
 pub const Error = error{ Bind, OutOfMemory };
@@ -554,4 +555,93 @@ pub const Session = struct {
         }
         return .{ .sql = sql, .columns = cols };
     }
+
+    /// `ALTER SESSION SET CURRENT_SCHEMA = "<schema>"` (the schema name as Oracle should read it,
+    /// already folded: see sqlgen.parseName). Unqualified names in later statements resolve there.
+    pub fn setCurrentSchema(self: Session, a: std.mem.Allocator, schema: []const u8, msg: *Msg) Error!void {
+        const sql = sqlgen.alterSchemaSql(a, schema) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            msg.set("duckdb_oracle: current_schema \"{s}\" is not a valid Oracle schema name", .{schema});
+            return error.Bind;
+        };
+        defer a.free(sql);
+        var stmt: ?*c.dpiStmt = null;
+        if (c.dpiConn_prepareStmt(self.conn, 0, sql.ptr, len32(sql), null, 0, &stmt) != c.DPI_SUCCESS) {
+            oracle.setDpiError(msg, self.ctx, "set current_schema");
+            return error.Bind;
+        }
+        defer _ = c.dpiStmt_release(stmt);
+        var ncols: u32 = 0;
+        if (c.dpiStmt_execute(stmt, c.DPI_MODE_EXEC_DEFAULT, &ncols) != c.DPI_SUCCESS) {
+            oracle.setDpiError(msg, self.ctx, "set current_schema");
+            return error.Bind;
+        }
+    }
+
+    /// Run a short catalog query whose columns are all VARCHAR2 and return its rows as owned text
+    /// (a NULL becomes an empty string). For name resolution only: at most `max_rows` rows.
+    /// Free with `freeRows`.
+    pub fn queryStrings(self: Session, a: std.mem.Allocator, sql: []const u8, ncols: u32, max_rows: u32, msg: *Msg) Error![][][]u8 {
+        var stmt: ?*c.dpiStmt = null;
+        if (c.dpiConn_prepareStmt(self.conn, 0, sql.ptr, len32(sql), null, 0, &stmt) != c.DPI_SUCCESS) {
+            oracle.setDpiError(msg, self.ctx, "catalog query");
+            return error.Bind;
+        }
+        defer _ = c.dpiStmt_release(stmt);
+        var got: u32 = 0;
+        if (c.dpiStmt_execute(stmt, c.DPI_MODE_EXEC_DEFAULT, &got) != c.DPI_SUCCESS) {
+            oracle.setDpiError(msg, self.ctx, "catalog query");
+            return error.Bind;
+        }
+        if (got != ncols) {
+            msg.set("duckdb_oracle: catalog query returned {d} columns, expected {d}", .{ got, ncols });
+            return error.Bind;
+        }
+        var rows: std.ArrayList([][]u8) = .empty;
+        // errdefers run last-declared first: free the rows' contents, then the list itself
+        errdefer rows.deinit(a);
+        errdefer freeRows(a, rows.items);
+        while (rows.items.len < max_rows) {
+            var found: c_int = 0;
+            var buffer_row: u32 = 0;
+            if (c.dpiStmt_fetch(stmt, &found, &buffer_row) != c.DPI_SUCCESS) {
+                oracle.setDpiError(msg, self.ctx, "catalog query fetch");
+                return error.Bind;
+            }
+            if (found == 0) break;
+            const row = try a.alloc([]u8, ncols);
+            var filled: usize = 0;
+            errdefer {
+                for (row[0..filled]) |cell| a.free(cell);
+                a.free(row);
+            }
+            while (filled < ncols) : (filled += 1) {
+                var native: c.dpiNativeTypeNum = 0;
+                var data: [*c]c.dpiData = null;
+                if (c.dpiStmt_getQueryValue(stmt, @intCast(filled + 1), &native, &data) != c.DPI_SUCCESS or data == null) {
+                    oracle.setDpiError(msg, self.ctx, "catalog query value");
+                    return error.Bind;
+                }
+                const d = data[0];
+                if (d.isNull != 0) {
+                    row[filled] = try a.alloc(u8, 0);
+                } else if (native == c.DPI_NATIVE_TYPE_BYTES) {
+                    const b = d.value.asBytes;
+                    row[filled] = try a.dupe(u8, if (b.ptr == null) "" else b.ptr[0..b.length]);
+                } else {
+                    msg.set("duckdb_oracle: catalog query column {d} is not text", .{filled + 1});
+                    return error.Bind;
+                }
+            }
+            try rows.append(a, row);
+        }
+        return rows.toOwnedSlice(a);
+    }
 };
+
+pub fn freeRows(a: std.mem.Allocator, rows: []const [][]u8) void {
+    for (rows) |row| {
+        for (row) |cell| a.free(cell);
+        a.free(row);
+    }
+}

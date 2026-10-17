@@ -41,13 +41,13 @@ jobs:
           - name: Oracle Free 23ai
             image: gvenzl/oracle-free:23-slim
             service: FREEPDB1
-            dirs: test/e2e test/e2e/spatial test/e2e/23ai test/e2e/needs-setup/23ai
-            setup: test/e2e/setup/23ai
+            dirs: test/e2e test/e2e/spatial test/e2e/23ai test/e2e/needs-setup/23ai test/e2e/needs-setup/schema
+            setup: test/e2e/setup/common test/e2e/setup/23ai
           - name: Oracle XE 21c
             image: gvenzl/oracle-xe:21-slim
             service: XEPDB1
-            dirs: test/e2e test/e2e/spatial
-            setup: ''
+            dirs: test/e2e test/e2e/spatial test/e2e/needs-setup/schema
+            setup: test/e2e/setup/common
     services:
       oracle:
         image: ${{ matrix.image }}

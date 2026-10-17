@@ -91,6 +91,10 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("test/e2e/needs-setup/23ai", free_dirs, "the tests that need the setup scripts run after them")
         self.assertNotIn("test/e2e/23ai", xe_dirs, "XE 21c has no VECTOR or BOOLEAN")
         self.assertNotIn("test/e2e/needs-setup/23ai", xe_dirs)
+        for image in images.values():
+            # the schema tests and the setup they need run on both databases, the setup before the tests
+            self.assertIn("test/e2e/needs-setup/schema", image["dirs"].split(), image["image"])
+            self.assertEqual(image["setup"].split()[0], "test/e2e/setup/common", image["image"])
         self.assertIn("test/e2e/setup/23ai", images["gvenzl/oracle-free:23-slim"]["setup"].split())
         self.assertNotIn("test/e2e/setup/23ai", images["gvenzl/oracle-xe:21-slim"]["setup"].split())
         self.assertEqual(job["services"]["oracle"]["image"], "${{ matrix.image }}")
@@ -253,7 +257,7 @@ class PinsAndTests(unittest.TestCase):
                     break
                 head.append(line.strip())
             self.assertTrue(any(h.startswith("-- e2e:") for h in head), f"{name}: needs a '-- e2e: <title>' header")
-            self.assertIn("oracle_query('@DSN@'", text, name)
+            self.assertRegex(text, r"oracle_(query|scan|tables)\('@DSN@'", name)
             # comments may explain where the login comes from; the SQL itself must never carry it
             sql = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--")).lower()
             self.assertNotRegex(sql, r"password|getenv|current_setting|\bsecret", name)

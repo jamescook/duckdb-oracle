@@ -8,6 +8,7 @@ test {
     _ = @import("client_locator.zig");
     _ = @import("session.zig");
     _ = @import("sqlgen.zig");
+    _ = @import("oracle.zig");
     _ = @import("compat.zig");
     _ = @import("compat_env_test.zig");
 }
