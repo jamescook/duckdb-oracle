@@ -11,6 +11,7 @@ const oracle = @import("oracle.zig");
 const arch = @import("arch.zig");
 const timeouts = @import("timeouts.zig");
 const cursor_mod = @import("cursor.zig");
+const session_mod = @import("session.zig");
 const OdpiBackend = @import("odpi_backend.zig").OdpiBackend;
 const OdpiReader = @import("odpi_backend.zig").OdpiReader;
 
@@ -98,6 +99,8 @@ fn registerOracleQuery(conn: c.duckdb_connection) bool {
     // password given in SQL leaks. The password is read from an environment
     // variable; `password_env` only chooses which one.
     duck("duckdb_table_function_add_named_parameter")(tf, "password_env", vt);
+    // 'password' (default) | 'external' (wallet, Kerberos, OS authentication)
+    duck("duckdb_table_function_add_named_parameter")(tf, "auth", vt);
     // 'double' (default, checked) | 'lossy_double' | 'varchar': see column.NumberMode
     duck("duckdb_table_function_add_named_parameter")(tf, "unconstrained_number", vt);
 
@@ -174,20 +177,8 @@ fn positionalParam(info: c.duckdb_bind_info, idx: u64) ?[]u8 {
     return valueToOwned(v);
 }
 
-fn envOwned(name: [:0]const u8) ?[]u8 {
-    return compat.getEnvOwned(alloc, name);
-}
 
-fn freeSecret(s: ?[]u8) void {
-    if (s) |p| {
-        std.crypto.secureZero(u8, p);
-        alloc.free(p);
-    }
-}
 
-fn len32(s: []const u8) u32 {
-    return @intCast(@min(s.len, std.math.maxInt(u32)));
-}
 
 fn setInvalid(vec: c.duckdb_vector, row: u64) void {
     duck("duckdb_vector_ensure_validity_writable")(vec);
@@ -207,8 +198,7 @@ fn assignString(vec: c.duckdb_vector, row: u64, s: []const u8) void {
 const fetch_budget_bytes: u64 = 64 << 20;
 
 const QueryBind = struct {
-    ctx: *c.dpiContext,
-    conn: ?*c.dpiConn = null,
+    session: ?session_mod.Session = null,
     sql: []u8 = &.{},
     plans: []column.Column = &.{},
     /// Oracle column names, for error messages
@@ -218,7 +208,7 @@ const QueryBind = struct {
     fetch_rows: u32 = 0,
 
     fn destroy(self: *QueryBind) void {
-        if (self.conn) |conn| _ = c.dpiConn_release(conn);
+        if (self.session) |sess| sess.close();
         alloc.free(self.sql);
         alloc.free(self.plans);
         for (self.names) |n| alloc.free(n);
@@ -248,35 +238,36 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
         msg.set("duckdb_oracle: oracle_query: sql must not be NULL", .{});
         return error.Bind;
     };
-    var sql_owned: ?[]u8 = sql;
-    defer if (sql_owned) |s| alloc.free(s);
+    defer alloc.free(sql);
+    // pure checks first: they need no server and fail fast
+    const sql_prepared = session_mod.prepareSql(alloc, sql) catch |e| {
+        session_mod.explainSqlError(e, msg);
+        return error.Bind;
+    };
+    defer alloc.free(sql_prepared);
 
-    const user = namedParam(info, "user") orelse envOwned("ORACLE_USER");
-    defer if (user) |u| alloc.free(u);
-
-    // Name of the environment variable that holds the password.
-    var pw_var_owned: ?[:0]u8 = null;
-    defer if (pw_var_owned) |v| alloc.free(v);
-    var pw_var: [:0]const u8 = "ORACLE_PASSWORD";
+    // Credentials: `user := ...`, `password_env := ...`, `auth := ...` (session.zig applies the policy)
+    const user_param = namedParam(info, "user");
+    defer if (user_param) |u| alloc.free(u);
+    var pw_env_param: ?[]u8 = null;
+    defer if (pw_env_param) |v| alloc.free(v);
     if (hasNamedParam(info, "password_env")) {
-        const given = namedParam(info, "password_env") orelse {
+        pw_env_param = namedParam(info, "password_env") orelse {
             msg.set("duckdb_oracle: oracle_query: password_env must not be NULL", .{});
             return error.Bind;
         };
+    }
+    var auth: session_mod.Auth = .password;
+    if (hasNamedParam(info, "auth")) {
+        const given = namedParam(info, "auth") orelse {
+            msg.set("duckdb_oracle: oracle_query: auth must not be NULL", .{});
+            return error.Bind;
+        };
         defer alloc.free(given);
-        pw_var_owned = try compat.dupeZ(alloc, given);
-        pw_var = pw_var_owned.?;
-    }
-    const password = envOwned(pw_var);
-    defer freeSecret(password);
-
-    if (user == null or user.?.len == 0) {
-        msg.set("duckdb_oracle: oracle_query: no user given; pass user := '...' or set the ORACLE_USER environment variable", .{});
-        return error.Bind;
-    }
-    if (password == null or password.?.len == 0) {
-        msg.set("duckdb_oracle: oracle_query: no password given: the environment variable {s} is empty or not set (passwords are never accepted as SQL arguments; password_env := 'NAME' selects another variable)", .{pw_var});
-        return error.Bind;
+        auth = session_mod.Auth.parse(given) orelse {
+            msg.set("duckdb_oracle: oracle_query: auth must be 'password' or 'external', got '{s}'", .{given});
+            return error.Bind;
+        };
     }
 
     var number_mode: column.NumberMode = .double;
@@ -295,90 +286,32 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     const connect_secs = try secondsParam(info, msg, "connect_timeout", timeouts.default_connect_secs);
     const call_secs = try secondsParam(info, msg, "timeout", timeouts.default_call_secs);
 
-    // First Oracle use in this process loads OCI here.
-    const ctx = oracle.getContext(msg) orelse {
-        const tmp = msg.*;
-        var hb: [768]u8 = undefined;
-        const h = oracle.archHint(&hb, false);
-        if (h.len > 0)
-            msg.set("duckdb_oracle: Oracle client library could not be loaded: {s} | hint: {s}", .{ tmp.slice(), h })
-        else
-            msg.set("duckdb_oracle: Oracle client library could not be loaded: {s}", .{tmp.slice()});
-        return error.Bind;
-    };
+    const sess = try session_mod.Session.open(alloc, .{
+        .dsn = dsn,
+        .creds = .{ .user = user_param, .password_env = pw_env_param, .auth = auth },
+        .connect_secs = connect_secs,
+        .call_secs = call_secs,
+    }, msg);
 
-    const bind = try alloc.create(QueryBind);
-    bind.* = .{ .ctx = ctx, .vector_size = @intCast(@min(duck("duckdb_vector_size")(), std.math.maxInt(u32))) };
+    const bind = alloc.create(QueryBind) catch {
+        sess.close();
+        return error.OutOfMemory;
+    };
+    bind.* = .{ .session = sess, .vector_size = @intCast(@min(duck("duckdb_vector_size")(), std.math.maxInt(u32))) };
     var bind_owned = true;
     defer if (bind_owned) bind.destroy();
 
-    var common = std.mem.zeroes(c.dpiCommonCreateParams);
-    if (c.dpiContext_initCommonCreateParams(ctx, &common) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "init connection parameters");
-        return error.Bind;
-    }
-    common.createMode = c.DPI_MODE_CREATE_THREADED;
-    common.encoding = "UTF-8";
-    common.nencoding = "UTF-8";
-
-    const connect_dsn = try timeouts.withConnectTimeout(alloc, dsn, connect_secs);
-    defer alloc.free(connect_dsn);
-
-    var conn: ?*c.dpiConn = null;
-    if (c.dpiConn_create(ctx, user.?.ptr, len32(user.?), password.?.ptr, len32(password.?), connect_dsn.ptr, len32(connect_dsn), &common, null, &conn) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "connect failed");
-        return error.Bind;
-    }
-    bind.conn = conn;
-
-    // Bounds every later round trip on this session (describe, execute, each fetch).
-    if (call_secs > 0 and c.dpiConn_setCallTimeout(conn, timeouts.callTimeoutMs(call_secs)) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "set call timeout");
-        return error.Bind;
-    }
-
-    // Describe the query without executing it.
-    var stmt: ?*c.dpiStmt = null;
-    if (c.dpiConn_prepareStmt(conn, 0, sql.ptr, len32(sql), null, 0, &stmt) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "prepare failed");
-        return error.Bind;
-    }
-    defer _ = c.dpiStmt_release(stmt);
-
-    var sinfo = std.mem.zeroes(c.dpiStmtInfo);
-    if (c.dpiStmt_getInfo(stmt, &sinfo) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "statement info");
-        return error.Bind;
-    }
-    // Never run DDL/DML/PL/SQL: OCI executes DDL even in describe-only mode.
-    if (sinfo.isQuery == 0) {
-        msg.set("duckdb_oracle: oracle_query only runs queries (SELECT / WITH); writes, DDL and PL/SQL are not supported", .{});
-        return error.Bind;
-    }
-
-    var ncols: u32 = 0;
-    if (c.dpiStmt_execute(stmt, c.DPI_MODE_EXEC_DESCRIBE_ONLY, &ncols) != c.DPI_SUCCESS) {
-        oracle.setDpiError(msg, ctx, "describe failed");
-        return error.Bind;
-    }
-    if (ncols == 0) {
-        msg.set("duckdb_oracle: oracle_query: the query returns no columns", .{});
-        return error.Bind;
-    }
+    var desc = try sess.describe(alloc, sql_prepared, msg);
+    defer desc.deinit(alloc);
+    const ncols: u32 = @intCast(desc.columns.len);
 
     bind.plans = try alloc.alloc(column.Column, ncols);
     bind.names = try alloc.alloc([]u8, ncols);
     @memset(bind.names, &.{}); // destroy() frees every entry, also after a partial failure
-    var col: u32 = 0;
-    while (col < ncols) : (col += 1) {
-        var qi = std.mem.zeroes(c.dpiQueryInfo);
-        if (c.dpiStmt_getQueryInfo(stmt, col + 1, &qi) != c.DPI_SUCCESS) {
-            oracle.setDpiError(msg, ctx, "describe column");
-            return error.Bind;
-        }
-        const name: []const u8 = if (qi.name) |n| n[0..qi.nameLength] else "";
-        const plan = column.fromTypeInfo(&qi.typeInfo, .{ .number = number_mode }) catch {
-            msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, column.oracleTypeName(qi.typeInfo.oracleTypeNum) });
+    for (desc.columns, 0..) |ci, col| {
+        const name = ci.name;
+        const plan = column.fromTypeInfo(&ci.type_info, .{ .number = number_mode }) catch {
+            msg.set("duckdb_oracle: column {d} (\"{s}\") has unsupported Oracle type {s}; convert it in the query, e.g. TO_CHAR(...) or JSON_SERIALIZE(...) (native JSON needs Instant Client 21c+, VECTOR/BOOLEAN need 23ai+)", .{ col + 1, name, column.oracleTypeName(ci.type_info.oracleTypeNum) });
             return error.Bind;
         };
         bind.plans[col] = plan;
@@ -392,8 +325,8 @@ fn queryBindImpl(info: c.duckdb_bind_info, msg: *Msg) !void {
     }
 
     bind.fetch_rows = column.fetchRows(bind.plans, bind.vector_size, fetch_budget_bytes);
-    bind.sql = sql;
-    sql_owned = null;
+    bind.sql = desc.sql; // the normalised statement; ownership moves to the bind data
+    desc.sql = &.{};
     bind_owned = false;
     duck("duckdb_bind_set_bind_data")(info, bind, destroyQueryBind);
 }
@@ -471,10 +404,11 @@ fn queryInitImpl(info: c.duckdb_init_info, msg: *Msg) !void {
         return error.Init;
     }));
 
-    const backend: OdpiBackend = .{ .ctx = bind.ctx, .conn = bind.conn orelse {
+    const sess = bind.session orelse {
         msg.set("duckdb_oracle: missing connection", .{});
         return error.Init;
-    } };
+    };
+    const backend: OdpiBackend = .{ .ctx = sess.ctx, .conn = sess.conn };
     const cursor = OdpiCursor.open(alloc, backend, bind.sql, bind.plans, bind.fetch_rows, msg) catch return error.Init;
     errdefer cursor.destroy();
 
@@ -535,9 +469,9 @@ fn queryFunctionImpl(info: c.duckdb_function_info, output: c.duckdb_data_chunk, 
 fn describeWriteError(msg: *Msg, bind: *const QueryBind, col: usize, d: *const c.dpiData, e: column.Column.WriteError) void {
     const name = bind.names[col];
     switch (e) {
-        error.ReadVector => oracle.setDpiError(msg, bind.ctx, "read VECTOR"),
-        error.ReadJson => oracle.setDpiError(msg, bind.ctx, "read JSON"),
-        error.ReadRowid => oracle.setDpiError(msg, bind.ctx, "convert ROWID"),
+        error.ReadVector => oracle.setDpiError(msg, bind.session.?.ctx, "read VECTOR"),
+        error.ReadJson => oracle.setDpiError(msg, bind.session.?.ctx, "read JSON"),
+        error.ReadRowid => oracle.setDpiError(msg, bind.session.?.ctx, "convert ROWID"),
         error.PrecisionLoss => {
             const b = d.value.asBytes;
             const shown: []const u8 = if (b.ptr == null) "" else b.ptr[0..@min(b.length, 64)];

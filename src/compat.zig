@@ -27,8 +27,16 @@ const SpinMutex = struct {
     locked: std.atomic.Value(bool) = .init(false),
 
     pub fn lock(m: *SpinMutex) void {
+        var spins: u32 = 0;
         while (m.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
+            // The critical section includes loading the Oracle client (milliseconds
+            // to seconds); do not burn a core for all of it.
+            if (spins < 100) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
         }
     }
 

@@ -57,6 +57,51 @@ SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', connect_tim
 ----
 connect_timeout must be between 0 and
 
+# SQL that cannot be run is refused before any connection is made
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', '  ;  ');
+----
+sql must not be empty
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select * from dual for update');
+----
+FOR UPDATE
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select * from dual for
+   update nowait;');
+----
+FOR UPDATE
+
+# ... but FOR UPDATE inside a literal is just text, so this one gets as far as connecting
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select ''for update'' from dual;');
+----
+<REGEX>:.*duckdb_oracle: .*(DPI-1047|ORA-125[0-9][0-9]).*
+
+# Authentication mode: password (default) or external (wallet, Kerberos, OS)
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', auth := 'kerberos');
+----
+auth must be 'password' or 'external'
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', auth := NULL);
+----
+auth must not be NULL
+
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', auth := 'external', user := 'scott');
+----
+auth := 'external' takes no user
+
+# external authentication needs no ORACLE_USER / ORACLE_PASSWORD: it reaches the connect step
+statement error
+SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', auth := 'external');
+----
+<REGEX>:.*duckdb_oracle: .*(DPI-1047|ORA-125[0-9][0-9]).*
+
 # How NUMBERs without an exact DECIMAL form are materialised
 statement error
 SELECT * FROM oracle_query('127.0.0.1:1/NOPE', 'select 1 from dual', unconstrained_number := 'decimal');

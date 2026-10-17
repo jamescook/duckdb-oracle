@@ -224,15 +224,16 @@ architecture of the first `oci.dll` on the search path when that doesn't match t
 
 ## SQL surface (v1)
 
-### `oracle_query(dsn, sql, user := ..., password_env := ..., connect_timeout := ..., timeout := ...)`
+### `oracle_query(dsn, sql, user := ..., password_env := ..., auth := ..., connect_timeout := ..., timeout := ...)`
 
 Table function. It runs one Oracle query and returns its result set.
 
 | Argument | Meaning |
 |---|---|
 | `dsn VARCHAR` | Easy Connect string such as `localhost:1521/ORCLPDB1`, or a TNS alias (`TNS_ADMIN`) |
-| `sql VARCHAR` | An Oracle `SELECT` / `WITH` query, using Oracle SQL dialect |
+| `sql VARCHAR` | An Oracle `SELECT` / `WITH` query, using Oracle SQL dialect. One trailing `;` is removed (Oracle rejects it). `SELECT ... FOR UPDATE` is refused: it takes row locks that would stay held for the life of the session |
 | `user := VARCHAR` | Optional. Defaults to `$ORACLE_USER` |
+| `auth := VARCHAR` | Optional. `'password'` (default) or `'external'`: Oracle wallet (`/@alias`), Kerberos or OS authentication, where no user or password is given. `user` and `password_env` are refused in external mode |
 | `password_env := VARCHAR` | Optional. Name of the environment variable that holds the password. Defaults to `ORACLE_PASSWORD` |
 | `unconstrained_number := VARCHAR` | Optional. How a `NUMBER` with no exact `DECIMAL` form is returned (see Type mapping): `'double'` (default, checked), `'lossy_double'` or `'varchar'` |
 | `connect_timeout := BIGINT` | Optional. Seconds allowed for the connection handshake. Default **30**, `0` = no limit. Added to Easy Connect strings as `connect_timeout=N` unless the DSN already sets it; TNS aliases and `(DESCRIPTION=...)` strings are used unchanged (set it in `sqlnet.ora`/the descriptor) |
@@ -369,6 +370,7 @@ src/compat.zig               Zig-version shims for the extension code
 src/c_headers.h              C headers translated by b.addTranslateC (module "c_headers")
 mise.toml                    default Zig toolchain (0.15.2)
 src/duckdb_oracle.zig              entrypoint (duckdb_oracle_init_c_api), table functions, DuckDB vectors
+src/session.zig              one session: credentials, auth mode, connect + timeouts, read-only SQL guard, describe (+ policy tests)
 src/oracle.zig               lazy ODPI-C context, error formatting, client info
 src/cursor.zig               result-set lifetime: statement, fetch variables, early close; generic over a backend (+ tests with an in-memory backend)
 src/odpi_backend.zig         the ODPI-C adapters: backend for cursor.zig, handle reader for column.zig

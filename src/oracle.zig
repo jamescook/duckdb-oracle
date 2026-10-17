@@ -26,7 +26,7 @@ pub const odpi_version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ c.DPI_MAJOR_VER
 
 /// Optional override for the directory containing oci.dll / libclntsh.so.
 /// Useful on Windows hosts that also have a 32-bit client on PATH.
-pub const lib_dir_env = "DUCKDB_ORACLE_CLIENT_LIB_DIR";
+const lib_dir_env = "DUCKDB_ORACLE_CLIENT_LIB_DIR";
 
 /// Fixed-size, NUL-terminated message buffer (no allocation on error paths).
 pub const Msg = struct {
@@ -148,7 +148,7 @@ pub const ClientInfo = struct {
 
 extern fn duckdb_oracle_host_arch(buf: [*]u8, buflen: usize) usize;
 
-pub fn hostArch(buf: *[32]u8) []const u8 {
+fn hostArch(buf: *[32]u8) []const u8 {
     const n = duckdb_oracle_host_arch(buf, buf.len);
     return buf[0..n];
 }
